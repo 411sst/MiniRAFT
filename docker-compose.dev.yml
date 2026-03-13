@@ -1,0 +1,53 @@
+# Development overrides — use with: docker-compose -f docker-compose.yml -f docker-compose.dev.yml up
+services:
+  replica1:
+    build:
+      context: ./replica
+      dockerfile: Dockerfile.dev
+    volumes:
+      - ./replica:/app/src      # bind-mount for air hot-reload
+      - ./logs/replica1:/data
+    environment:
+      - LOG_LEVEL=debug
+
+  replica2:
+    build:
+      context: ./replica
+      dockerfile: Dockerfile.dev
+    volumes:
+      - ./replica:/app/src
+      - ./logs/replica2:/data
+    environment:
+      - LOG_LEVEL=debug
+
+  replica3:
+    build:
+      context: ./replica
+      dockerfile: Dockerfile.dev
+    volumes:
+      - ./replica:/app/src
+      - ./logs/replica3:/data
+    environment:
+      - LOG_LEVEL=debug
+
+  gateway:
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile.dev
+    volumes:
+      - ./gateway:/app/src
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - LOG_LEVEL=debug
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    ports:
+      - "3000:3000"
+    environment:
+      - VITE_GATEWAY_URL=http://localhost:8080
