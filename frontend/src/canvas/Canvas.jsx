@@ -16,25 +16,39 @@ export default function Canvas({ tool, strokeWidth, userInfo, onUserAssigned, on
   const canvasRef = useRef(null)
   const isDrawingRef = useRef(false)
   const sendMessageRef = useRef(null)
+  const userIdRef = useRef(null)
 
-  // Keep drawing config in sync with props
+  // Per-user undo/redo stacks — each entry is { strokeId, data }
+  const undoStackRef = useRef([])   // committed strokes this user owns
+  const redoStackRef = useRef([])   // popped strokes available for redo
+
   useEffect(() => {
     setDrawingConfig(userInfo?.colour || '#ffffff', strokeWidth, tool)
   }, [tool, strokeWidth, userInfo])
 
   const handleMessage = useCallback((type, payload) => {
     if (!payload) return
+
     if (type === 'STROKE_COMMITTED') {
-      const { strokeId, points, colour, width, strokeTool } = payload
+      const { strokeId, points, colour, width, strokeTool, userId } = payload
       if (strokeId) {
-        addCommittedStroke(strokeId, { points, colour, width, tool: strokeTool || 'pen' })
+        const data = { points, colour, width, tool: strokeTool || 'pen' }
+        addCommittedStroke(strokeId, data)
+        // Track strokes this user owns for undo.
+        if (userId && userId === userIdRef.current) {
+          undoStackRef.current.push({ strokeId, data })
+          redoStackRef.current = [] // any new commit clears redo
+        }
       }
-    } else if (type === 'UNDO_COMPENSATION' || type === 'STROKE_UNDO') {
+    } else if (type === 'UNDO_COMPENSATION') {
       if (payload.strokeId) {
         removeStroke(payload.strokeId)
       }
-    } else if (type === 'CANVAS_CLEAR') {
-      // handled via onCanvasSync with empty entries
+    } else if (type === 'STROKE_UNDO') {
+      // Also accept STROKE_UNDO (phase 1 compat)
+      if (payload.strokeId) {
+        removeStroke(payload.strokeId)
+      }
     }
   }, [])
 
@@ -43,12 +57,17 @@ export default function Canvas({ tool, strokeWidth, userInfo, onUserAssigned, on
     if (payload?.colour) {
       setDrawingConfig(payload.colour, strokeWidth, tool)
     }
+    if (payload?.userId) {
+      userIdRef.current = payload.userId
+    }
   }, [onUserAssigned, strokeWidth, tool])
 
   const handleCanvasSync = useCallback((entries) => {
     if (!Array.isArray(entries)) return
     entries.forEach((entry) => {
-      if (entry.strokeId && entry.data) {
+      if (entry.type === 'UNDO_COMPENSATION') {
+        if (entry.strokeId) removeStroke(entry.strokeId)
+      } else if (entry.strokeId && entry.data) {
         addCommittedStroke(entry.strokeId, entry.data)
       }
     })
@@ -60,20 +79,41 @@ export default function Canvas({ tool, strokeWidth, userInfo, onUserAssigned, on
     onCanvasSync: handleCanvasSync,
   })
 
-  // Keep sendMessage accessible from event handlers
   useEffect(() => {
     sendMessageRef.current = sendMessage
   }, [sendMessage])
 
-  // Propagate connection status up
   useEffect(() => {
     if (onConnectionStatus) onConnectionStatus(connectionStatus)
   }, [connectionStatus, onConnectionStatus])
 
-  // Handle undo/redo events dispatched from Toolbar
+  // Undo: pop from undoStack, push to redoStack, send STROKE_UNDO
   useEffect(() => {
-    const onUndo = () => sendMessageRef.current?.('STROKE_UNDO', {})
-    const onRedo = () => sendMessageRef.current?.('STROKE_REDO', {})
+    const onUndo = () => {
+      const entry = undoStackRef.current.pop()
+      if (!entry) return
+      redoStackRef.current.push(entry)
+      // Optimistically remove locally
+      removeStroke(entry.strokeId)
+      sendMessageRef.current?.('STROKE_UNDO', { strokeId: entry.strokeId })
+    }
+
+    // Redo: pop from redoStack, push to undoStack, re-send as STROKE_DRAW
+    const onRedo = () => {
+      const entry = redoStackRef.current.pop()
+      if (!entry) return
+      undoStackRef.current.push(entry)
+      // Optimistically re-add locally
+      addCommittedStroke(entry.strokeId, entry.data)
+      sendMessageRef.current?.('STROKE_DRAW', {
+        strokeId: entry.strokeId,
+        points: entry.data.points,
+        colour: entry.data.colour,
+        width: entry.data.width,
+        strokeTool: entry.data.tool,
+      })
+    }
+
     window.addEventListener('miniraft:undo', onUndo)
     window.addEventListener('miniraft:redo', onRedo)
     return () => {
@@ -82,7 +122,6 @@ export default function Canvas({ tool, strokeWidth, userInfo, onUserAssigned, on
     }
   }, [])
 
-  // Init canvas, render loop, and mouse/touch wiring
   useEffect(() => {
     const canvas = canvasRef.current
     if (!canvas) return
@@ -90,7 +129,6 @@ export default function Canvas({ tool, strokeWidth, userInfo, onUserAssigned, on
     const cleanup = initCanvas(canvas)
     startRenderLoop(canvas)
 
-    // Wire mouseup / touchend to finalize stroke and send to WS
     const handleMouseUp = () => {
       if (!isDrawingRef.current) return
       isDrawingRef.current = false
@@ -104,7 +142,7 @@ export default function Canvas({ tool, strokeWidth, userInfo, onUserAssigned, on
           width: stroke.width,
           strokeTool: stroke.tool,
         })
-        // Optimistically add as committed
+        // Optimistically show the stroke locally; it will be confirmed via STROKE_COMMITTED.
         addCommittedStroke(strokeId, {
           points: stroke.points,
           colour: stroke.colour,
@@ -114,9 +152,7 @@ export default function Canvas({ tool, strokeWidth, userInfo, onUserAssigned, on
       }
     }
 
-    const handleMouseDown = () => {
-      isDrawingRef.current = true
-    }
+    const handleMouseDown = () => { isDrawingRef.current = true }
 
     const handleTouchEnd = () => {
       if (!isDrawingRef.current) return
@@ -140,9 +176,7 @@ export default function Canvas({ tool, strokeWidth, userInfo, onUserAssigned, on
       }
     }
 
-    const handleTouchStart = () => {
-      isDrawingRef.current = true
-    }
+    const handleTouchStart = () => { isDrawingRef.current = true }
 
     canvas.addEventListener('mousedown', handleMouseDown)
     canvas.addEventListener('mouseup', handleMouseUp)

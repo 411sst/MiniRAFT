@@ -163,6 +163,7 @@ func main() {
 	mux.HandleFunc("/status", statusHandler.ServeStatus)
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/stroke", strokeHandler(node, raftLog, logger))
+	mux.HandleFunc("/undo", undoHandler(node, logger))
 	mux.HandleFunc("/entries", entriesHandler(raftLog, logger))
 
 	httpServer := &http.Server{
@@ -255,6 +256,72 @@ func strokeHandler(node *raft.RaftNode, raftLog *rafflog.RaftLog, logger *zap.Lo
 		committed, err := node.Replicate(entry, 3*time.Second)
 		if err != nil {
 			logger.Warn("Replicate failed", zap.Error(err))
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]interface{}{ //nolint:errcheck
+				"error": err.Error(),
+			})
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(committed) //nolint:errcheck
+	}
+}
+
+// undoRequest is the JSON body for POST /undo.
+type undoRequest struct {
+	UserID  string          `json:"userId"`
+	Payload json.RawMessage `json:"payload"`
+}
+
+// undoPayload is the inner payload from the gateway.
+type undoPayload struct {
+	StrokeID string `json:"strokeId"`
+}
+
+// undoHandler handles POST /undo — creates an UNDO_COMPENSATION entry and replicates it.
+func undoHandler(node *raft.RaftNode, logger *zap.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		defer r.Body.Close()
+
+		w.Header().Set("Content-Type", "application/json")
+
+		if node.GetState() != raft.Leader {
+			leaderID := node.GetLeaderID()
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]interface{}{ //nolint:errcheck
+				"error":    "not leader",
+				"leaderId": leaderID,
+			})
+			return
+		}
+
+		var req undoRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid body: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		var up undoPayload
+		if err := json.Unmarshal(req.Payload, &up); err != nil || up.StrokeID == "" {
+			http.Error(w, "invalid payload: missing strokeId", http.StatusBadRequest)
+			return
+		}
+
+		entry := rafflog.LogEntry{
+			Type:      rafflog.EntryTypeUndo,
+			StrokeID:  up.StrokeID,
+			UserID:    req.UserID,
+			Timestamp: time.Now().UnixMilli(),
+		}
+
+		committed, err := node.Replicate(entry, 3*time.Second)
+		if err != nil {
+			logger.Warn("undo Replicate failed", zap.Error(err))
 			w.WriteHeader(http.StatusServiceUnavailable)
 			json.NewEncoder(w).Encode(map[string]interface{}{ //nolint:errcheck
 				"error": err.Error(),

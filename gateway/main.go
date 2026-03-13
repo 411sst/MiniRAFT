@@ -177,17 +177,27 @@ func internalCommittedHandler(hub *ws.WSHub, logger *zap.Logger) http.HandlerFun
 			zap.String("userId", entry.UserID),
 		)
 
-		// Build the payload that the frontend's STROKE_COMMITTED handler expects.
-		hub.BroadcastMessage("STROKE_COMMITTED", map[string]interface{}{
-			"strokeId":   entry.StrokeID,
-			"userId":     entry.UserID,
-			"points":     entry.Data.Points,
-			"colour":     entry.Data.Colour,
-			"width":      entry.Data.Width,
-			"strokeTool": entry.Data.Tool,
-			"index":      entry.Index,
-			"term":       entry.Term,
-		})
+		if entry.Type == "UNDO_COMPENSATION" {
+			// Broadcast undo removal to all clients.
+			hub.BroadcastMessage("UNDO_COMPENSATION", map[string]interface{}{
+				"strokeId": entry.StrokeID,
+				"userId":   entry.UserID,
+				"index":    entry.Index,
+				"term":     entry.Term,
+			})
+		} else {
+			// Build the payload that the frontend's STROKE_COMMITTED handler expects.
+			hub.BroadcastMessage("STROKE_COMMITTED", map[string]interface{}{
+				"strokeId":   entry.StrokeID,
+				"userId":     entry.UserID,
+				"points":     entry.Data.Points,
+				"colour":     entry.Data.Colour,
+				"width":      entry.Data.Width,
+				"strokeTool": entry.Data.Tool,
+				"index":      entry.Index,
+				"term":       entry.Term,
+			})
+		}
 
 		w.WriteHeader(http.StatusNoContent)
 	}

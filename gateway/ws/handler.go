@@ -40,6 +40,13 @@ type Client struct {
 	Send   chan []byte
 }
 
+// pendingStroke holds a stroke buffered during a leaderless period.
+type pendingStroke struct {
+	userID  string
+	payload json.RawMessage
+	kind    string // "draw" or "undo"
+}
+
 // WSHub manages all WebSocket clients.
 type WSHub struct {
 	mu          sync.RWMutex
@@ -52,6 +59,10 @@ type WSHub struct {
 		DecrConnections()
 		IncrStrokes()
 	}
+
+	// Stroke buffer: holds strokes queued while there is no leader.
+	bufMu   sync.Mutex
+	buffer  []pendingStroke
 }
 
 // NewWSHub creates a new WSHub.
@@ -60,12 +71,14 @@ func NewWSHub(tracker *leader.LeaderTracker, logger *zap.Logger, metrics interfa
 	DecrConnections()
 	IncrStrokes()
 }) *WSHub {
-	return &WSHub{
+	h := &WSHub{
 		clients: make(map[string]*Client),
 		tracker: tracker,
 		logger:  logger,
 		metrics: metrics,
 	}
+	go h.drainBuffer()
+	return h
 }
 
 // ServeHTTP upgrades an HTTP connection to WebSocket and registers the client.
@@ -243,6 +256,7 @@ func (h *WSHub) handleMessage(client *Client, msg WSMessage) {
 
 	case "STROKE_UNDO":
 		h.logger.Info("STROKE_UNDO received", zap.String("userID", client.UserID))
+		go h.forwardUndoToLeader(client.UserID, msg.Payload)
 
 	default:
 		h.logger.Warn("unknown ws message type",
@@ -252,13 +266,46 @@ func (h *WSHub) handleMessage(client *Client, msg WSMessage) {
 	}
 }
 
+// drainBuffer periodically retries buffered strokes once a leader is available.
+func (h *WSHub) drainBuffer() {
+	ticker := time.NewTicker(300 * time.Millisecond)
+	defer ticker.Stop()
+	for range ticker.C {
+		_, ok := h.tracker.GetLeaderConfig()
+		if !ok {
+			continue
+		}
+
+		h.bufMu.Lock()
+		if len(h.buffer) == 0 {
+			h.bufMu.Unlock()
+			continue
+		}
+		pending := h.buffer
+		h.buffer = nil
+		h.bufMu.Unlock()
+
+		h.logger.Info("draining stroke buffer", zap.Int("count", len(pending)))
+		for _, p := range pending {
+			if p.kind == "undo" {
+				go h.forwardUndoToLeader(p.userID, p.payload)
+			} else {
+				go h.forwardStrokeToLeader(p.userID, p.payload)
+			}
+		}
+	}
+}
+
 // forwardStrokeToLeader sends a stroke to the leader's POST /stroke endpoint.
 // The leader will replicate it and call back /internal/committed; that handler
 // broadcasts STROKE_COMMITTED to all clients.
 func (h *WSHub) forwardStrokeToLeader(userID string, payload json.RawMessage) {
 	cfg, ok := h.tracker.GetLeaderConfig()
 	if !ok {
-		h.logger.Warn("no leader available, dropping stroke", zap.String("userID", userID))
+		h.logger.Warn("no leader — buffering stroke until election completes", zap.String("userID", userID))
+		h.bufMu.Lock()
+		h.buffer = append(h.buffer, pendingStroke{userID: userID, payload: payload, kind: "draw"})
+		h.bufMu.Unlock()
 		return
 	}
 
@@ -287,6 +334,40 @@ func (h *WSHub) forwardStrokeToLeader(userID string, payload json.RawMessage) {
 		zap.String("leaderID", cfg.ID),
 		zap.Int("status", resp.StatusCode),
 	)
+}
+
+// forwardUndoToLeader sends a STROKE_UNDO to the leader's POST /undo endpoint.
+func (h *WSHub) forwardUndoToLeader(userID string, payload json.RawMessage) {
+	cfg, ok := h.tracker.GetLeaderConfig()
+	if !ok {
+		h.logger.Warn("no leader — buffering undo until election completes", zap.String("userID", userID))
+		h.bufMu.Lock()
+		h.buffer = append(h.buffer, pendingStroke{userID: userID, payload: payload, kind: "undo"})
+		h.bufMu.Unlock()
+		return
+	}
+
+	body, err := json.Marshal(map[string]interface{}{
+		"userId":  userID,
+		"payload": payload,
+	})
+	if err != nil {
+		h.logger.Error("failed to marshal undo body", zap.Error(err))
+		return
+	}
+
+	undoURL := cfg.StrokeURL[:len(cfg.StrokeURL)-len("stroke")] + "undo"
+	httpClient := &http.Client{Timeout: 5 * time.Second}
+	resp, err := httpClient.Post(undoURL, "application/json", bytes.NewReader(body))
+	if err != nil {
+		h.logger.Warn("failed to forward undo to leader",
+			zap.String("leaderID", cfg.ID),
+			zap.Error(err),
+		)
+		return
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body) //nolint:errcheck
 }
 
 // sendJSON serialises payload as a WSMessage and enqueues it for the client.
