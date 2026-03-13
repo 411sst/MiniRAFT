@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
@@ -99,7 +100,7 @@ func main() {
 	}
 	defer wal.Close() //nolint:errcheck
 
-	// 3. Replay WAL.
+	// 3. Replay WAL to restore persisted state.
 	walState, err := wal.Replay()
 	if err != nil {
 		logger.Fatal("failed to replay WAL", zap.Error(err))
@@ -111,7 +112,7 @@ func main() {
 		zap.Int64("commitIndex", walState.CommitIndex),
 	)
 
-	// 4. Create RaftLog.
+	// 4. Create RaftLog and load from WAL.
 	raftLog := rafflog.NewRaftLog(wal, logger)
 	if err := raftLog.LoadFromWAL(); err != nil {
 		logger.Fatal("failed to load log from WAL", zap.Error(err))
@@ -120,19 +121,30 @@ func main() {
 	// 5. Create metrics.
 	m := metrics.NewReplicaMetrics(replicaID)
 
-	// 6. Create RaftNode (inject WAL state).
+	// 6. Create RaftNode and restore persisted term/votedFor.
 	node := raft.NewRaftNode(replicaID, peers, raftLog, wal, logger, m)
-	if walState.Term > 0 {
-		node.BecomeFollower(walState.Term, "")
+	node.RestoreState(walState.Term, walState.VotedFor)
+
+	// 7. Dial peers (needed before SyncFromPeers and Start).
+	node.Dial()
+
+	// 7b. Attempt catch-up sync from peers (best-effort; safe to fail).
+	node.SyncFromPeers()
+
+	// 8. Wire commit callback: notify gateway on every committed entry.
+	gatewayURL := getEnv("GATEWAY_URL", "")
+	if gatewayURL != "" {
+		node.SetOnCommit(func(entry rafflog.LogEntry) {
+			notifyGatewayCommitted(gatewayURL, entry, logger)
+		})
 	}
 
-	// 7. Create gRPC server.
+	// 8. Create gRPC server.
 	rpcServer := raft.NewRaftRPCServer(node, logger)
-
 	grpcServer := grpc.NewServer()
 	proto.RegisterRaftServiceServer(grpcServer, rpcServer)
 
-	// 8. Start gRPC server.
+	// 9. Start gRPC server.
 	grpcLis, err := net.Listen("tcp", ":"+grpcPort)
 	if err != nil {
 		logger.Fatal("failed to listen on gRPC port", zap.String("port", grpcPort), zap.Error(err))
@@ -144,13 +156,13 @@ func main() {
 		}
 	}()
 
-	// 9. Build HTTP mux.
+	// 10. Build HTTP mux.
 	statusHandler := status.NewStatusHandler(node)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", statusHandler.ServeHealth)
 	mux.HandleFunc("/status", statusHandler.ServeStatus)
 	mux.Handle("/metrics", promhttp.Handler())
-	mux.HandleFunc("/stroke", strokeHandler(node, logger))
+	mux.HandleFunc("/stroke", strokeHandler(node, raftLog, logger))
 	mux.HandleFunc("/entries", entriesHandler(raftLog, logger))
 
 	httpServer := &http.Server{
@@ -158,10 +170,10 @@ func main() {
 		Handler: mux,
 	}
 
-	// 10. Start RaftNode.
+	// 11. Start RaftNode.
 	node.Start()
 
-	// 11. Start HTTP server (blocking).
+	// 12. Start HTTP server (blocking).
 	logger.Info("replica started",
 		zap.String("replicaId", replicaID),
 		zap.String("grpcPort", grpcPort),
@@ -173,18 +185,30 @@ func main() {
 	}
 }
 
-// strokeHandler handles POST /stroke.
-// Phase 1 stub: if not leader returns 503; if leader returns 202.
-func strokeHandler(node *raft.RaftNode, logger *zap.Logger) http.HandlerFunc {
+// strokeRequest is the JSON body for POST /stroke.
+type strokeRequest struct {
+	UserID   string          `json:"userId"`
+	Payload  json.RawMessage `json:"payload"`
+}
+
+// strokePayload is the inner payload from the gateway.
+type strokePayload struct {
+	StrokeID  string            `json:"strokeId"`
+	Points    []rafflog.Point   `json:"points"`
+	Colour    string            `json:"colour"`
+	Width     float64           `json:"width"`
+	StrokeTool string           `json:"strokeTool"`
+}
+
+// strokeHandler handles POST /stroke — appends the stroke to the RAFT log and
+// blocks until it is committed by a majority.
+func strokeHandler(node *raft.RaftNode, raftLog *rafflog.RaftLog, logger *zap.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-
-		// Discard body.
-		io.Copy(io.Discard, r.Body) //nolint:errcheck
-		r.Body.Close()              //nolint:errcheck
+		defer r.Body.Close()
 
 		w.Header().Set("Content-Type", "application/json")
 
@@ -198,11 +222,71 @@ func strokeHandler(node *raft.RaftNode, logger *zap.Logger) http.HandlerFunc {
 			return
 		}
 
-		w.WriteHeader(http.StatusAccepted)
-		json.NewEncoder(w).Encode(map[string]interface{}{ //nolint:errcheck
-			"accepted": true,
-		})
+		var req strokeRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid body: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		var sp strokePayload
+		if err := json.Unmarshal(req.Payload, &sp); err != nil {
+			http.Error(w, "invalid payload: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		tool := sp.StrokeTool
+		if tool == "" {
+			tool = "pen"
+		}
+
+		entry := rafflog.LogEntry{
+			Type:      rafflog.EntryTypeStroke,
+			StrokeID:  sp.StrokeID,
+			UserID:    req.UserID,
+			Timestamp: time.Now().UnixMilli(),
+			Data: rafflog.StrokeData{
+				Points: sp.Points,
+				Colour: sp.Colour,
+				Width:  sp.Width,
+				Tool:   tool,
+			},
+		}
+
+		committed, err := node.Replicate(entry, 3*time.Second)
+		if err != nil {
+			logger.Warn("Replicate failed", zap.Error(err))
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]interface{}{ //nolint:errcheck
+				"error": err.Error(),
+			})
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(committed) //nolint:errcheck
 	}
+}
+
+// notifyGatewayCommitted posts a committed log entry to the gateway.
+func notifyGatewayCommitted(gatewayURL string, entry rafflog.LogEntry, logger *zap.Logger) {
+	body, err := json.Marshal(entry)
+	if err != nil {
+		logger.Error("failed to marshal committed entry", zap.Error(err))
+		return
+	}
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Post(
+		gatewayURL+"/internal/committed",
+		"application/json",
+		strings.NewReader(string(body)),
+	)
+	if err != nil {
+		logger.Warn("failed to notify gateway", zap.Error(err))
+		return
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body) //nolint:errcheck
 }
 
 // entriesHandler handles GET /entries — returns all committed log entries as JSON.

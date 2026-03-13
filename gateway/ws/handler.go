@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"sync"
 	"time"
@@ -46,7 +47,6 @@ type WSHub struct {
 	colourIndex int
 	tracker     *leader.LeaderTracker
 	logger      *zap.Logger
-	gatewayURL  string
 	metrics     interface {
 		IncrConnections()
 		DecrConnections()
@@ -70,7 +70,6 @@ func NewWSHub(tracker *leader.LeaderTracker, logger *zap.Logger, metrics interfa
 
 // ServeHTTP upgrades an HTTP connection to WebSocket and registers the client.
 func (h *WSHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Handle CORS preflight
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	if r.Method == http.MethodOptions {
 		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
@@ -85,7 +84,6 @@ func (h *WSHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Assign unique userID and colour
 	userID := fmt.Sprintf("user-%d", time.Now().UnixNano())
 
 	h.mu.Lock()
@@ -105,19 +103,62 @@ func (h *WSHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.metrics.IncrConnections()
 	}
 
-	// Send USER_COLOR_ASSIGNED
+	// Send USER_COLOR_ASSIGNED.
 	h.sendJSON(client, "USER_COLOR_ASSIGNED", map[string]string{
 		"userId": userID,
 		"colour": colour,
 	})
 
-	// Phase 1: skip CANVAS_SYNC (stub)
+	// Send CANVAS_SYNC: fetch all committed entries from the leader.
+	go h.sendCanvasSync(client)
 
-	// Start write goroutine
+	// Start write goroutine.
 	go h.writePump(client)
 
-	// Read pump runs in the current goroutine
+	// Read pump runs in the current goroutine.
 	h.readPump(client)
+}
+
+// sendCanvasSync fetches committed log entries from the leader and sends them to the client.
+func (h *WSHub) sendCanvasSync(client *Client) {
+	cfg, ok := h.tracker.GetLeaderConfig()
+	if !ok {
+		h.logger.Warn("CANVAS_SYNC: no leader available", zap.String("userID", client.UserID))
+		return
+	}
+
+	httpClient := &http.Client{Timeout: 3 * time.Second}
+	resp, err := httpClient.Get(cfg.EntriesURL)
+	if err != nil {
+		h.logger.Warn("CANVAS_SYNC: failed to fetch entries",
+			zap.String("url", cfg.EntriesURL),
+			zap.Error(err),
+		)
+		return
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		h.logger.Warn("CANVAS_SYNC: failed to read entries body", zap.Error(err))
+		return
+	}
+
+	// Parse entries to normalise the shape for the frontend.
+	var rawEntries []json.RawMessage
+	if err := json.Unmarshal(body, &rawEntries); err != nil {
+		h.logger.Warn("CANVAS_SYNC: failed to parse entries", zap.Error(err))
+		return
+	}
+
+	h.sendJSON(client, "CANVAS_SYNC", map[string]interface{}{
+		"entries": rawEntries,
+	})
+
+	h.logger.Debug("CANVAS_SYNC sent",
+		zap.String("userID", client.UserID),
+		zap.Int("entries", len(rawEntries)),
+	)
 }
 
 // readPump reads messages from the client until the connection closes.
@@ -194,25 +235,14 @@ func (h *WSHub) handleMessage(client *Client, msg WSMessage) {
 	case "STROKE_DRAW":
 		h.logger.Info("STROKE_DRAW received",
 			zap.String("userID", client.UserID),
-			zap.String("payload", string(msg.Payload)),
 		)
-		// Phase 1 stub: forward to leader via POST /stroke
 		go h.forwardStrokeToLeader(client.UserID, msg.Payload)
-
-		// Broadcast STROKE_COMMITTED back to all clients
-		h.BroadcastMessage("STROKE_COMMITTED", map[string]interface{}{
-			"userId":  client.UserID,
-			"payload": msg.Payload,
-		})
 		if h.metrics != nil {
 			h.metrics.IncrStrokes()
 		}
 
 	case "STROKE_UNDO":
-		h.logger.Info("STROKE_UNDO received",
-			zap.String("userID", client.UserID),
-			zap.String("payload", string(msg.Payload)),
-		)
+		h.logger.Info("STROKE_UNDO received", zap.String("userID", client.UserID))
 
 	default:
 		h.logger.Warn("unknown ws message type",
@@ -222,7 +252,9 @@ func (h *WSHub) handleMessage(client *Client, msg WSMessage) {
 	}
 }
 
-// forwardStrokeToLeader sends a stroke to the leader replica (Phase 1 stub).
+// forwardStrokeToLeader sends a stroke to the leader's POST /stroke endpoint.
+// The leader will replicate it and call back /internal/committed; that handler
+// broadcasts STROKE_COMMITTED to all clients.
 func (h *WSHub) forwardStrokeToLeader(userID string, payload json.RawMessage) {
 	cfg, ok := h.tracker.GetLeaderConfig()
 	if !ok {
@@ -239,8 +271,8 @@ func (h *WSHub) forwardStrokeToLeader(userID string, payload json.RawMessage) {
 		return
 	}
 
-	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Post(cfg.StrokeURL, "application/json", bytes.NewReader(body))
+	httpClient := &http.Client{Timeout: 5 * time.Second}
+	resp, err := httpClient.Post(cfg.StrokeURL, "application/json", bytes.NewReader(body))
 	if err != nil {
 		h.logger.Warn("failed to forward stroke to leader",
 			zap.String("leaderID", cfg.ID),
@@ -249,6 +281,8 @@ func (h *WSHub) forwardStrokeToLeader(userID string, payload json.RawMessage) {
 		return
 	}
 	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body) //nolint:errcheck
+
 	h.logger.Debug("stroke forwarded to leader",
 		zap.String("leaderID", cfg.ID),
 		zap.Int("status", resp.StatusCode),

@@ -5,33 +5,62 @@ import (
 )
 
 // AppendEntriesHandler validates and applies AppendEntries RPCs to the log.
-// Phase 1: stub that validates inputs and returns success.
 type AppendEntriesHandler struct {
 	log    *RaftLog
 	logger *zap.Logger
 }
 
 func NewAppendEntriesHandler(log *RaftLog, logger *zap.Logger) *AppendEntriesHandler {
-	return &AppendEntriesHandler{
-		log:    log,
-		logger: logger,
-	}
+	return &AppendEntriesHandler{log: log, logger: logger}
 }
 
-// HandleAppendEntries will be called by gRPC server in rpc_server.go.
-// Phase 1 stub: validates that prevLogIndex/prevLogTerm are consistent, returns success.
+// HandleAppendEntries applies the consistency check and appends entries to the log.
+// Returns (success, conflictIndex):
+//   - success=false + conflictIndex set means the leader should retry from conflictIndex.
+//   - success=true means all entries were applied and commitIndex was advanced.
 func (h *AppendEntriesHandler) HandleAppendEntries(
 	prevLogIndex int64,
 	prevLogTerm int64,
 	entries []LogEntry,
 	leaderCommit int64,
 ) (success bool, conflictIndex int64) {
-	h.logger.Debug("HandleAppendEntries stub",
-		zap.Int64("prevLogIndex", prevLogIndex),
-		zap.Int64("prevLogTerm", prevLogTerm),
-		zap.Int("numEntries", len(entries)),
-		zap.Int64("leaderCommit", leaderCommit),
-	)
-	// Phase 1: always return success
+	if prevLogIndex > 0 {
+		prev, ok := h.log.GetEntry(prevLogIndex)
+		if !ok {
+			h.logger.Debug("HandleAppendEntries: missing prevLogIndex",
+				zap.Int64("prevLogIndex", prevLogIndex),
+			)
+			return false, h.log.LastIndex() + 1
+		}
+		if prev.Term != prevLogTerm {
+			h.logger.Debug("HandleAppendEntries: prevLogTerm mismatch",
+				zap.Int64("prevLogIndex", prevLogIndex),
+				zap.Int64("expected", prevLogTerm),
+				zap.Int64("got", prev.Term),
+			)
+			return false, prevLogIndex
+		}
+	}
+
+	for _, entry := range entries {
+		existing, ok := h.log.GetEntry(entry.Index)
+		if ok {
+			if existing.Term != entry.Term {
+				h.log.TruncateFrom(entry.Index)
+				h.log.AppendEntry(entry) //nolint:errcheck
+			}
+		} else {
+			h.log.AppendEntry(entry) //nolint:errcheck
+		}
+	}
+
+	if leaderCommit > h.log.GetCommitIndex() {
+		newCommit := leaderCommit
+		if lastIdx := h.log.LastIndex(); lastIdx < newCommit {
+			newCommit = lastIdx
+		}
+		h.log.Commit(newCommit) //nolint:errcheck
+	}
+
 	return true, 0
 }

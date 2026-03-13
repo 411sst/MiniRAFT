@@ -115,6 +115,24 @@ func (l *RaftLog) LoadFromWAL() error {
 	return nil
 }
 
+// TruncateFrom removes all entries with Index >= fromIndex from memory.
+// The WAL is not rewritten; this is safe because truncated entries will be
+// replaced by entries from the leader before any future WAL replay.
+func (l *RaftLog) TruncateFrom(fromIndex int64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	cut := len(l.entries)
+	for i, e := range l.entries {
+		if e.Index >= fromIndex {
+			cut = i
+			break
+		}
+	}
+	l.entries = l.entries[:cut]
+	l.logger.Debug("truncated log", zap.Int64("fromIndex", fromIndex), zap.Int("remaining", len(l.entries)))
+}
+
 func (l *RaftLog) AllEntries() []LogEntry {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
