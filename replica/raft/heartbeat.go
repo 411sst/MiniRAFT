@@ -16,7 +16,8 @@ const heartbeatInterval = 150 * time.Millisecond
 // sendHeartbeats runs in its own goroutine while the node is Leader.
 // Every heartbeatInterval it sends AppendEntries (with any pending entries) or
 // a lightweight Heartbeat (if nothing new) to every peer.
-func sendHeartbeats(n *RaftNode) {
+// It exits when ctx is cancelled (via BecomeFollower or Stop).
+func (n *RaftNode) sendHeartbeats(ctx context.Context) {
 	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
 
@@ -81,15 +82,18 @@ func sendHeartbeats(n *RaftNode) {
 
 					if len(task.entries) == 0 {
 						// Empty heartbeat.
-						ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-						defer cancel()
+						rpcCtx, rpcCancel := context.WithTimeout(ctx, 100*time.Millisecond)
+						defer rpcCancel()
 
-						resp, err := client.Heartbeat(ctx, &proto.HeartbeatRequest{
+						resp, err := client.Heartbeat(rpcCtx, &proto.HeartbeatRequest{
 							Term:        term,
 							LeaderId:    leaderID,
 							CommitIndex: commitIndex,
 						})
 						if err != nil {
+							if ctx.Err() != nil {
+								return // stepdown cancelled us, not an error
+							}
 							n.logger.Debug("heartbeat RPC failed",
 								zap.String("peer", task.peer),
 								zap.Error(err),
@@ -115,10 +119,10 @@ func sendHeartbeats(n *RaftNode) {
 							}
 						}
 
-						ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-						defer cancel()
+						rpcCtx, rpcCancel := context.WithTimeout(ctx, 200*time.Millisecond)
+						defer rpcCancel()
 
-						resp, err := client.AppendEntries(ctx, &proto.AppendEntriesRequest{
+						resp, err := client.AppendEntries(rpcCtx, &proto.AppendEntriesRequest{
 							Term:         term,
 							LeaderId:     leaderID,
 							PrevLogIndex: task.prevLogIndex,
@@ -127,6 +131,9 @@ func sendHeartbeats(n *RaftNode) {
 							LeaderCommit: commitIndex,
 						})
 						if err != nil {
+							if ctx.Err() != nil {
+								return // stepdown cancelled us, not an error
+							}
 							n.logger.Debug("AppendEntries RPC failed",
 								zap.String("peer", task.peer),
 								zap.Error(err),
@@ -160,7 +167,7 @@ func sendHeartbeats(n *RaftNode) {
 							n.mu.Unlock()
 
 							// Immediately push missing entries without waiting for the next tick.
-							go n.catchUpPeer(task.peer, conflictIdx)
+							go n.catchUpPeer(ctx, task.peer, conflictIdx)
 						}
 					}
 
@@ -170,8 +177,8 @@ func sendHeartbeats(n *RaftNode) {
 				}(task)
 			}
 
-		case <-n.heartbeatStop:
-			n.logger.Debug("heartbeat sender stopped")
+		case <-ctx.Done():
+			n.logger.Debug("heartbeat sender stopped (context cancelled)")
 			return
 		}
 	}
@@ -179,8 +186,9 @@ func sendHeartbeats(n *RaftNode) {
 
 // catchUpPeer immediately sends all log entries from fromIndex to a specific peer via
 // AppendEntries — called when a heartbeat reveals a log mismatch, so we don't wait
-// 150ms for the next tick to retry.
-func (n *RaftNode) catchUpPeer(peer string, fromIndex int64) {
+// 150ms for the next tick to retry. ctx is the heartbeat context; cancellation on
+// stepdown exits the in-flight RPC immediately.
+func (n *RaftNode) catchUpPeer(ctx context.Context, peer string, fromIndex int64) {
 	client, ok := n.getPeerClient(peer)
 	if !ok {
 		return
@@ -222,10 +230,10 @@ func (n *RaftNode) catchUpPeer(peer string, fromIndex int64) {
 	}
 	n.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
+	rpcCtx, rpcCancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer rpcCancel()
 
-	resp, err := client.AppendEntries(ctx, &proto.AppendEntriesRequest{
+	resp, err := client.AppendEntries(rpcCtx, &proto.AppendEntriesRequest{
 		Term:         currentTerm,
 		LeaderId:     leaderID,
 		PrevLogIndex: prevLogIndex,
@@ -234,6 +242,9 @@ func (n *RaftNode) catchUpPeer(peer string, fromIndex int64) {
 		LeaderCommit: commitIndex,
 	})
 	if err != nil {
+		if ctx.Err() != nil {
+			return // stepdown cancelled us
+		}
 		n.logger.Debug("catchUpPeer AppendEntries failed", zap.String("peer", peer), zap.Error(err))
 		return
 	}
@@ -250,13 +261,5 @@ func (n *RaftNode) catchUpPeer(peer string, fromIndex int64) {
 		}
 		n.tryAdvanceCommitIndex()
 		n.mu.Unlock()
-	}
-}
-
-// stopHeartbeat signals the heartbeat goroutine to exit.
-func (n *RaftNode) stopHeartbeat() {
-	select {
-	case n.heartbeatStop <- struct{}{}:
-	default:
 	}
 }

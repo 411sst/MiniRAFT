@@ -15,23 +15,18 @@ func randomTimeout() time.Duration {
 	return time.Duration(500+rand.Intn(300)) * time.Millisecond
 }
 
-// resetElectionTimer stops any existing election timer and resets it with a new random timeout.
+// resetElectionTimer stops the current election timer and re-arms it with a new random
+// timeout. Must only be called after Start() has initialised n.electionTimer.
+// Safe to call without n.mu (timer operations are goroutine-safe per Go docs).
 func (n *RaftNode) resetElectionTimer() {
-	if n.electionTimer != nil {
-		if !n.electionTimer.Stop() {
-			select {
-			case <-n.electionTimer.C:
-			default:
-			}
+	if !n.electionTimer.Stop() {
+		// Drain the channel if the timer already fired but hasn't been read yet.
+		select {
+		case <-n.electionTimer.C:
+		default:
 		}
-		n.electionTimer.Reset(randomTimeout())
-		return
 	}
-
-	n.electionTimer = time.AfterFunc(randomTimeout(), func() {
-		n.logger.Warn("election timeout fired")
-		n.startElection()
-	})
+	n.electionTimer.Reset(randomTimeout())
 }
 
 // startElection runs a full RAFT election: sends RequestVote to all peers and
