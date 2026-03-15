@@ -1,6 +1,7 @@
 // ─── Drawing State ───────────────────────────────────────────────────────────
-let committedStrokes = new Map() // strokeId -> { points, colour, width, tool }
-let pendingStroke = null         // current user's in-progress stroke (optimistic)
+let committedStrokes = new Map() // strokeId -> { points, colour, width, tool }  (server-confirmed)
+let pendingStrokes = new Map()   // strokeId -> data — sent to server, not yet STROKE_COMMITTED
+let pendingStroke = null         // current user's in-progress stroke being drawn right now
 let dirty = true
 
 let rafId = null
@@ -143,16 +144,39 @@ export function addCommittedStroke(strokeId, data) {
   dirty = true
 }
 
+// addPendingStroke marks a stroke as sent but not yet confirmed by the server.
+// It will be drawn at reduced opacity until confirmStroke() promotes it.
+export function addPendingStroke(strokeId, data) {
+  pendingStrokes.set(strokeId, data)
+  dirty = true
+}
+
+// confirmStroke moves a stroke from the pending map to the committed map.
+// Called when STROKE_COMMITTED arrives for our own stroke.
+export function confirmStroke(strokeId, data) {
+  pendingStrokes.delete(strokeId)
+  committedStrokes.set(strokeId, data)
+  dirty = true
+}
+
 export function removeStroke(strokeId) {
-  if (committedStrokes.delete(strokeId)) {
+  const deleted = committedStrokes.delete(strokeId) || pendingStrokes.delete(strokeId)
+  if (deleted) {
     dirty = true
   }
 }
 
 export function clearAllStrokes() {
   committedStrokes.clear()
+  pendingStrokes.clear()
   pendingStroke = null
   dirty = true
+}
+
+// getPendingStrokes returns all strokes that were sent but not yet server-confirmed.
+// Used after a CANVAS_SYNC to re-send any that the server missed.
+export function getPendingStrokes() {
+  return Array.from(pendingStrokes.entries())
 }
 
 // ─── Rendering ───────────────────────────────────────────────────────────────
@@ -164,20 +188,30 @@ export function redraw(canvas) {
   // Clear
   ctx.clearRect(0, 0, canvas.width, canvas.height)
 
-  // Draw committed strokes
+  // Draw committed strokes at full opacity
   committedStrokes.forEach((stroke) => {
-    drawStroke(ctx, stroke)
+    drawStroke(ctx, stroke, 1.0)
   })
 
-  // Draw pending (optimistic) stroke on top
+  // Draw server-pending strokes (sent but not yet confirmed) at 70% opacity
+  if (pendingStrokes.size > 0) {
+    ctx.save()
+    ctx.globalAlpha = 0.7
+    pendingStrokes.forEach((stroke) => {
+      drawStroke(ctx, stroke, 1.0)
+    })
+    ctx.restore()
+  }
+
+  // Draw in-progress stroke (mouse held down) on top at full opacity
   if (pendingStroke && pendingStroke.points.length > 0) {
-    drawStroke(ctx, pendingStroke)
+    drawStroke(ctx, pendingStroke, 1.0)
   }
 
   dirty = false
 }
 
-function drawStroke(ctx, stroke) {
+function drawStroke(ctx, stroke, _opacity) {
   const { points, colour, width, tool } = stroke
   if (!points || points.length === 0) return
 

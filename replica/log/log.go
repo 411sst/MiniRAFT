@@ -118,9 +118,19 @@ func (l *RaftLog) LoadFromWAL() error {
 // TruncateFrom removes all entries with Index >= fromIndex from memory.
 // The WAL is not rewritten; this is safe because truncated entries will be
 // replaced by entries from the leader before any future WAL replay.
-func (l *RaftLog) TruncateFrom(fromIndex int64) {
+// Returns an error if fromIndex is at or below the commit index — truncating
+// committed entries would violate the Raft Leader Completeness property and
+// indicates a bug in the caller.
+func (l *RaftLog) TruncateFrom(fromIndex int64) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
+	if fromIndex <= l.commitIndex {
+		return fmt.Errorf(
+			"refusing to truncate committed entry: index %d <= commitIndex %d",
+			fromIndex, l.commitIndex,
+		)
+	}
 
 	cut := len(l.entries)
 	for i, e := range l.entries {
@@ -131,6 +141,7 @@ func (l *RaftLog) TruncateFrom(fromIndex int64) {
 	}
 	l.entries = l.entries[:cut]
 	l.logger.Debug("truncated log", zap.Int64("fromIndex", fromIndex), zap.Int("remaining", len(l.entries)))
+	return nil
 }
 
 func (l *RaftLog) AllEntries() []LogEntry {

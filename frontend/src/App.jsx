@@ -8,13 +8,13 @@ export default function App() {
   const [strokeWidth, setStrokeWidth] = useState(4)
   const [userInfo, setUserInfo] = useState(null)
   const [connectionStatus, setConnectionStatus] = useState('connecting')
+  const [leaderInfo, setLeaderInfo] = useState(null)
 
   const handleUserAssigned = useCallback((payload) => {
     setUserInfo({ userId: payload.userId, colour: payload.colour })
   }, [])
 
   const handleUndo = useCallback(() => {
-    // Undo logic is triggered via keyboard in Toolbar; Canvas listens to sendMessage
     window.dispatchEvent(new CustomEvent('miniraft:undo'))
   }, [])
 
@@ -34,6 +34,7 @@ export default function App() {
         onRedo={handleRedo}
         userColour={userInfo?.colour}
         connectionStatus={connectionStatus}
+        leaderInfo={leaderInfo}
       />
 
       {/* Main content area */}
@@ -46,6 +47,7 @@ export default function App() {
             userInfo={userInfo}
             onUserAssigned={handleUserAssigned}
             onConnectionStatus={setConnectionStatus}
+            onLeaderInfo={setLeaderInfo}
           />
         </div>
 

@@ -3,14 +3,70 @@ package chaos
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"math/rand"
+	"net"
 	"net/http"
 	"time"
 
-	dockerclient "github.com/docker/docker/client"
 	"go.uber.org/zap"
 	"miniraft/gateway/leader"
 )
+
+// dockerHTTP is a minimal Docker API client that talks to the Docker daemon
+// over the Unix socket using only stdlib net/http. It replaces
+// github.com/docker/docker/client, which pulls in otelhttp (requires Go 1.25).
+type dockerHTTP struct {
+	client *http.Client
+}
+
+func newDockerHTTP() *dockerHTTP {
+	return &dockerHTTP{
+		client: &http.Client{
+			Transport: &http.Transport{
+				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+					return (&net.Dialer{}).DialContext(ctx, "unix", "/var/run/docker.sock")
+				},
+			},
+		},
+	}
+}
+
+// ContainerStop sends POST /containers/{id}/stop?t={timeout} to the Docker daemon.
+func (d *dockerHTTP) ContainerStop(ctx context.Context, containerID string, timeoutSec int) error {
+	url := fmt.Sprintf("http://localhost/containers/%s/stop?t=%d", containerID, timeoutSec)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 && resp.StatusCode != 304 {
+		return fmt.Errorf("docker ContainerStop: HTTP %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// ContainerKill sends POST /containers/{id}/kill?signal={sig} to the Docker daemon.
+func (d *dockerHTTP) ContainerKill(ctx context.Context, containerID string, signal string) error {
+	url := fmt.Sprintf("http://localhost/containers/%s/kill?signal=%s", containerID, signal)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("docker ContainerKill: HTTP %d", resp.StatusCode)
+	}
+	return nil
+}
 
 // ChaosRequest is the JSON body for POST /chaos.
 type ChaosRequest struct {
@@ -27,27 +83,19 @@ type ChaosResponse struct {
 
 // ChaosHandler executes chaos actions against Docker containers.
 type ChaosHandler struct {
-	dockerClient *dockerclient.Client
-	tracker      *leader.LeaderTracker
-	logger       *zap.Logger
-	metrics      interface{ IncrChaos(mode string) }
+	docker  *dockerHTTP
+	tracker *leader.LeaderTracker
+	logger  *zap.Logger
+	metrics interface{ IncrChaos(mode string) }
 }
 
 // NewChaosHandler creates a new ChaosHandler, connecting to the Docker daemon.
 func NewChaosHandler(tracker *leader.LeaderTracker, logger *zap.Logger, metrics interface{ IncrChaos(mode string) }) (*ChaosHandler, error) {
-	cli, err := dockerclient.NewClientWithOpts(
-		dockerclient.FromEnv,
-		dockerclient.WithAPIVersionNegotiation(),
-	)
-	if err != nil {
-		return nil, err
-	}
-
 	return &ChaosHandler{
-		dockerClient: cli,
-		tracker:      tracker,
-		logger:       logger,
-		metrics:      metrics,
+		docker:  newDockerHTTP(),
+		tracker: tracker,
+		logger:  logger,
+		metrics: metrics,
 	}, nil
 }
 
@@ -85,15 +133,7 @@ func (h *ChaosHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if len(healthy) == 0 {
-			// Fall back to all replicas
 			for _, s := range statuses {
-				healthy = append(healthy, s.ReplicaID)
-			}
-		}
-		if len(healthy) == 0 {
-			// Last resort: pick from tracker replicas
-			allStatuses := h.tracker.GetAllStatuses()
-			for _, s := range allStatuses {
 				healthy = append(healthy, s.ReplicaID)
 			}
 		}
@@ -120,12 +160,9 @@ func (h *ChaosHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	switch mode {
 	case "graceful":
-		stopTimeout := 5 // seconds
-		actionErr = h.dockerClient.ContainerStop(ctx, target, dockerclient.StopOptions{
-			Timeout: &stopTimeout,
-		})
+		actionErr = h.docker.ContainerStop(ctx, target, 5)
 	case "hard":
-		actionErr = h.dockerClient.ContainerKill(ctx, target, "SIGKILL")
+		actionErr = h.docker.ContainerKill(ctx, target, "SIGKILL")
 	default:
 		http.Error(w, "unknown mode: "+mode, http.StatusBadRequest)
 		return
@@ -176,9 +213,3 @@ func ServeHTTPStub(w http.ResponseWriter, r *http.Request) {
 		"error": "chaos endpoint unavailable: Docker socket not accessible",
 	})
 }
-
-// contextKey is used to avoid context key collisions.
-type contextKey string
-
-// ensure context import is used
-var _ = context.Background

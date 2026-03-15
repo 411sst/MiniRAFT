@@ -81,7 +81,8 @@ type RaftNode struct {
 	nextIndex       map[string]int64
 	matchIndex      map[string]int64
 	electionTimer   *time.Timer
-	heartbeatStop   chan struct{}
+	electionStop    chan struct{} // closed by Stop() to exit the election loop goroutine
+	heartbeatCancel context.CancelFunc // non-nil while Leader; cancel stops sendHeartbeats
 	leaderID        string
 	lastHeartbeatMs int64
 	logger          *zap.Logger
@@ -114,7 +115,8 @@ func NewRaftNode(
 		log:             raftLog,
 		nextIndex:       make(map[string]int64),
 		matchIndex:      make(map[string]int64),
-		heartbeatStop:   make(chan struct{}),
+		electionStop:    make(chan struct{}),
+		heartbeatCancel: nil,
 		logger:          logger,
 		metrics:         m,
 		wal:             wal,
@@ -141,11 +143,33 @@ func (n *RaftNode) Dial() {
 	n.dialPeers()
 }
 
-// Start starts the election timer (begin participating in RAFT).
+// Start starts the election timer and the election loop goroutine (begin participating in RAFT).
 // Call Dial() first so peer connections are ready.
 func (n *RaftNode) Start() {
 	n.logger.Info("starting RAFT node", zap.String("id", n.id), zap.Strings("peers", n.peers))
-	n.resetElectionTimer()
+
+	// Initialise the election timer (time.NewTimer, not time.AfterFunc — the goroutine
+	// below drains the channel, so we need a real channel-backed timer).
+	n.electionTimer = time.NewTimer(randomTimeout())
+
+	// Single election loop goroutine: runs for the lifetime of the node and never
+	// relaunches. This prevents concurrent startElection() calls that could arise
+	// from multiple time.AfterFunc firings overlapping.
+	go func() {
+		for {
+			select {
+			case <-n.electionTimer.C:
+				n.mu.Lock()
+				shouldElect := n.state != Leader
+				n.mu.Unlock()
+				if shouldElect {
+					n.startElection()
+				}
+			case <-n.electionStop:
+				return
+			}
+		}
+	}()
 }
 
 // SyncFromPeers tries to fetch missing log entries from any available peer via SyncLog RPC.
@@ -169,10 +193,15 @@ func (n *RaftNode) SyncFromPeers() {
 			continue
 		}
 
+		n.mu.Lock()
+		currentTerm := n.currentTerm
+		n.mu.Unlock()
+
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		resp, err := client.SyncLog(ctx, &proto.SyncLogRequest{
 			ReplicaId: n.id,
 			FromIndex: fromIndex,
+			Term:      currentTerm,
 		})
 		cancel()
 
@@ -302,12 +331,18 @@ func (n *RaftNode) BecomeFollower(term int64, leaderID string) {
 func (n *RaftNode) becomeFollowerLocked(term int64, leaderID string) {
 	n.logger.Info("becoming follower", zap.Int64("term", term), zap.String("leaderID", leaderID))
 
+	// Stop the heartbeat goroutine immediately — don't wait for the next tick.
+	if n.heartbeatCancel != nil {
+		n.heartbeatCancel()
+		n.heartbeatCancel = nil
+	}
+
 	if term > n.currentTerm {
 		n.currentTerm = term
 		n.votedFor = ""
 		if n.wal != nil {
-			n.wal.WriteTerm(term)   //nolint:errcheck
-			n.wal.WriteVote("")     //nolint:errcheck
+			n.wal.WriteTerm(term) //nolint:errcheck
+			n.wal.WriteVote("")   //nolint:errcheck
 		}
 	}
 
@@ -324,6 +359,13 @@ func (n *RaftNode) becomeFollowerLocked(term int64, leaderID string) {
 func (n *RaftNode) BecomeLeader() {
 	n.mu.Lock()
 
+	// Cancel any previous heartbeat goroutine before creating a new one.
+	// This prevents a double-heartbeat window if BecomeLeader is called twice.
+	if n.heartbeatCancel != nil {
+		n.heartbeatCancel()
+		n.heartbeatCancel = nil
+	}
+
 	n.logger.Info("becoming leader", zap.Int64("term", n.currentTerm))
 	n.state = Leader
 	n.leaderID = n.id
@@ -339,9 +381,12 @@ func (n *RaftNode) BecomeLeader() {
 		n.metrics.RaftState.Set(float64(Leader))
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	n.heartbeatCancel = cancel
+
 	n.mu.Unlock()
 
-	go sendHeartbeats(n)
+	go n.sendHeartbeats(ctx)
 }
 
 // Replicate appends an entry as leader and blocks until committed (or timeout).
@@ -388,8 +433,29 @@ func (n *RaftNode) Replicate(entry rafflog.LogEntry, timeout time.Duration) (raf
 	}
 }
 
-// tryAdvanceCommitIndex checks if any uncommitted entries now have majority replication.
-// Must be called with n.mu held.
+// Stop shuts down the node, cancelling the heartbeat goroutine and election loop goroutine.
+func (n *RaftNode) Stop() {
+	n.mu.Lock()
+	if n.heartbeatCancel != nil {
+		n.heartbeatCancel()
+		n.heartbeatCancel = nil
+	}
+	n.mu.Unlock()
+
+	// Close electionStop once; the election loop goroutine will exit on next select.
+	select {
+	case <-n.electionStop:
+		// already closed — don't close twice (panic)
+	default:
+		close(n.electionStop)
+	}
+}
+
+// tryAdvanceCommitIndex checks whether any log index has been replicated to a majority
+// of nodes by counting matchIndex values. This is equivalent to the N-1 buffered channel
+// pattern described in the PRD but handles multi-round replication correctly: a single
+// call can commit multiple entries if matchIndex advanced on several peers simultaneously
+// (e.g. after a SyncLog catch-up). Must be called with n.mu held.
 func (n *RaftNode) tryAdvanceCommitIndex() {
 	if n.state != Leader {
 		return

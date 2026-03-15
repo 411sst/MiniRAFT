@@ -72,7 +72,7 @@ export default function ChaosButton() {
           onChange={(e) => setMode(e.target.value)}
           style={selectStyle}
         >
-          <option value="random">Random</option>
+          <option value="random">Surprise</option>
           <option value="graceful">Graceful</option>
           <option value="hard">Hard Kill</option>
         </select>
@@ -117,10 +117,12 @@ export default function ChaosButton() {
         >
           {lastResult.error ? (
             <span>Error: {lastResult.error}</span>
-          ) : (
+          ) : lastResult.killed ? (
             <span>
-              {lastResult.message || JSON.stringify(lastResult)}
+              Killed <strong>{lastResult.killed}</strong> ({lastResult.mode === 'graceful' ? 'graceful stop' : 'hard kill'})
             </span>
+          ) : (
+            <span>{JSON.stringify(lastResult)}</span>
           )}
         </div>
       )}

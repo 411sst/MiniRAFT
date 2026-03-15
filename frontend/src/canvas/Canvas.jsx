@@ -6,13 +6,17 @@ import {
   continueStroke,
   endStroke,
   addCommittedStroke,
+  addPendingStroke,
+  confirmStroke,
+  getPendingStrokes,
   removeStroke,
+  clearAllStrokes,
   startRenderLoop,
   stopRenderLoop,
   setDrawingConfig,
 } from './drawing'
 
-export default function Canvas({ tool, strokeWidth, userInfo, onUserAssigned, onConnectionStatus }) {
+export default function Canvas({ tool, strokeWidth, userInfo, onUserAssigned, onConnectionStatus, onLeaderInfo }) {
   const canvasRef = useRef(null)
   const isDrawingRef = useRef(false)
   const sendMessageRef = useRef(null)
@@ -33,7 +37,9 @@ export default function Canvas({ tool, strokeWidth, userInfo, onUserAssigned, on
       const { strokeId, points, colour, width, strokeTool, userId } = payload
       if (strokeId) {
         const data = { points, colour, width, tool: strokeTool || 'pen' }
-        addCommittedStroke(strokeId, data)
+        // confirmStroke moves the stroke from pending (70% opacity) to committed (100%).
+        // For other users' strokes it just adds to committed directly.
+        confirmStroke(strokeId, data)
         // Track strokes this user owns for undo.
         if (userId && userId === userIdRef.current) {
           undoStackRef.current.push({ strokeId, data })
@@ -64,16 +70,39 @@ export default function Canvas({ tool, strokeWidth, userInfo, onUserAssigned, on
 
   const handleCanvasSync = useCallback((entries) => {
     if (!Array.isArray(entries)) return
+
+    // Capture any locally-pending strokes before clearing — we'll re-send those
+    // that the server doesn't know about yet (sent but not yet replicated).
+    const localPending = getPendingStrokes()
+
+    // Clear existing canvas state before replaying — critical for reconnect correctness.
+    clearAllStrokes()
+    const syncedIds = new Set()
     entries.forEach((entry) => {
       if (entry.type === 'UNDO_COMPENSATION') {
         if (entry.strokeId) removeStroke(entry.strokeId)
       } else if (entry.strokeId && entry.data) {
         addCommittedStroke(entry.strokeId, entry.data)
+        syncedIds.add(entry.strokeId)
+      }
+    })
+
+    // Re-send any pending strokes not accounted for in the sync snapshot.
+    localPending.forEach(([strokeId, data]) => {
+      if (!syncedIds.has(strokeId)) {
+        addPendingStroke(strokeId, data)
+        sendMessageRef.current?.('STROKE_DRAW', {
+          strokeId,
+          points: data.points,
+          colour: data.colour,
+          width: data.width,
+          strokeTool: data.tool,
+        })
       }
     })
   }, [])
 
-  const { sendMessage, connectionStatus } = useDrawingWS({
+  const { sendMessage, connectionStatus, leaderInfo } = useDrawingWS({
     onMessage: handleMessage,
     onUserAssigned: handleUserAssigned,
     onCanvasSync: handleCanvasSync,
@@ -87,6 +116,10 @@ export default function Canvas({ tool, strokeWidth, userInfo, onUserAssigned, on
     if (onConnectionStatus) onConnectionStatus(connectionStatus)
   }, [connectionStatus, onConnectionStatus])
 
+  useEffect(() => {
+    if (onLeaderInfo) onLeaderInfo(leaderInfo)
+  }, [leaderInfo, onLeaderInfo])
+
   // Undo: pop from undoStack, push to redoStack, send STROKE_UNDO
   useEffect(() => {
     const onUndo = () => {
@@ -98,15 +131,18 @@ export default function Canvas({ tool, strokeWidth, userInfo, onUserAssigned, on
       sendMessageRef.current?.('STROKE_UNDO', { strokeId: entry.strokeId })
     }
 
-    // Redo: pop from redoStack, push to undoStack, re-send as STROKE_DRAW
+    // Redo: pop from redoStack, push to undoStack with a NEW strokeId, re-send as STROKE_DRAW.
+    // A new strokeId is required because the Raft log already contains an UNDO_COMPENSATION
+    // for the original strokeId — reusing it would create a duplicate log entry.
     const onRedo = () => {
       const entry = redoStackRef.current.pop()
       if (!entry) return
-      undoStackRef.current.push(entry)
-      // Optimistically re-add locally
-      addCommittedStroke(entry.strokeId, entry.data)
+      const newStrokeId = crypto.randomUUID()
+      undoStackRef.current.push({ strokeId: newStrokeId, data: entry.data })
+      // Show at 70% opacity until STROKE_COMMITTED confirms it.
+      addPendingStroke(newStrokeId, entry.data)
       sendMessageRef.current?.('STROKE_DRAW', {
-        strokeId: entry.strokeId,
+        strokeId: newStrokeId,
         points: entry.data.points,
         colour: entry.data.colour,
         width: entry.data.width,
@@ -134,7 +170,8 @@ export default function Canvas({ tool, strokeWidth, userInfo, onUserAssigned, on
       isDrawingRef.current = false
       const stroke = endStroke()
       if (stroke && stroke.points.length > 0) {
-        const strokeId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+        const strokeId = crypto.randomUUID()
+        const data = { points: stroke.points, colour: stroke.colour, width: stroke.width, tool: stroke.tool }
         sendMessageRef.current?.('STROKE_DRAW', {
           strokeId,
           points: stroke.points,
@@ -142,13 +179,8 @@ export default function Canvas({ tool, strokeWidth, userInfo, onUserAssigned, on
           width: stroke.width,
           strokeTool: stroke.tool,
         })
-        // Optimistically show the stroke locally; it will be confirmed via STROKE_COMMITTED.
-        addCommittedStroke(strokeId, {
-          points: stroke.points,
-          colour: stroke.colour,
-          width: stroke.width,
-          tool: stroke.tool,
-        })
+        // Show at 70% opacity until STROKE_COMMITTED confirms it.
+        addPendingStroke(strokeId, data)
       }
     }
 
@@ -159,7 +191,8 @@ export default function Canvas({ tool, strokeWidth, userInfo, onUserAssigned, on
       isDrawingRef.current = false
       const stroke = endStroke()
       if (stroke && stroke.points.length > 0) {
-        const strokeId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+        const strokeId = crypto.randomUUID()
+        const data = { points: stroke.points, colour: stroke.colour, width: stroke.width, tool: stroke.tool }
         sendMessageRef.current?.('STROKE_DRAW', {
           strokeId,
           points: stroke.points,
@@ -167,12 +200,7 @@ export default function Canvas({ tool, strokeWidth, userInfo, onUserAssigned, on
           width: stroke.width,
           strokeTool: stroke.tool,
         })
-        addCommittedStroke(strokeId, {
-          points: stroke.points,
-          colour: stroke.colour,
-          width: stroke.width,
-          tool: stroke.tool,
-        })
+        addPendingStroke(strokeId, data)
       }
     }
 

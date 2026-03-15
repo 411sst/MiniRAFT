@@ -9,6 +9,7 @@ export default function Toolbar({
   onRedo,
   userColour,
   connectionStatus,
+  leaderInfo,
 }) {
   // Register keyboard shortcuts
   useEffect(() => {
@@ -29,23 +30,20 @@ export default function Toolbar({
   }, [onUndo, onRedo])
 
   // Connection status indicator
-  const statusDotColor =
-    connectionStatus === 'connected'
-      ? '#22c55e'
-      : connectionStatus === 'reconnecting'
-      ? '#f59e0b'
-      : connectionStatus === 'disconnected'
-      ? '#ef4444'
-      : '#6b7280'
+  const isConnected = connectionStatus === 'connected'
+  const isElection = isConnected && (!leaderInfo || !leaderInfo.leaderId)
 
-  const statusLabel =
-    connectionStatus === 'connected'
-      ? 'Connected'
-      : connectionStatus === 'reconnecting'
-      ? 'Reconnecting...'
-      : connectionStatus === 'disconnected'
-      ? 'Disconnected'
-      : 'Connecting...'
+  const statusDotColor = !isConnected
+    ? (connectionStatus === 'reconnecting' ? '#f59e0b' : connectionStatus === 'disconnected' ? '#ef4444' : '#6b7280')
+    : isElection
+    ? '#f59e0b'
+    : '#22c55e'
+
+  const statusLabel = !isConnected
+    ? (connectionStatus === 'reconnecting' ? 'Reconnecting...' : connectionStatus === 'disconnected' ? 'Disconnected' : 'Connecting...')
+    : isElection
+    ? 'Election in progress...'
+    : `Leader: ${leaderInfo.leaderId} (term ${leaderInfo.term})`
 
   return (
     <div
@@ -213,10 +211,21 @@ export default function Toolbar({
             flexShrink: 0,
           }}
         />
+        {isElection && (
+          <div style={{
+            width: 10, height: 10,
+            border: '2px solid #f59e0b',
+            borderTopColor: 'transparent',
+            borderRadius: '50%',
+            animation: 'spin 0.8s linear infinite',
+            flexShrink: 0,
+          }} />
+        )}
         <span style={{ color: '#9ca3af', fontSize: '12px', whiteSpace: 'nowrap' }}>
           {statusLabel}
         </span>
       </div>
+      <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
     </div>
   )
 }
