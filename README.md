@@ -5,42 +5,57 @@ algorithm to replicate every brushstroke across a three-node cluster in real tim
 All drawing state is durable — the cluster survives complete restarts and single-node
 failures without losing a stroke.
 
+![Go](https://img.shields.io/badge/Go-1.22-00ADD8?logo=go&logoColor=white)
+![gRPC](https://img.shields.io/badge/gRPC-protobuf-244c5a?logo=google&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-compose-2496ED?logo=docker&logoColor=white)
+![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=black)
+![License](https://img.shields.io/badge/license-coursework-lightgrey)
+
+---
+
+## Contents
+
+- [Architecture](#architecture)
+- [How it works](#how-it-works)
+- [RAFT protocol parameters](#raft-protocol-parameters)
+- [Quick start](#quick-start)
+- [Demo scenarios](#demo-scenarios)
+- [Failure scenarios](#failure-scenarios)
+- [Team & component ownership](#team-component-ownership)
+- [Known limitations](#known-limitations)
+
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         Browser(s)                               │
-│  ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌─────────────┐  │
-│  │  Canvas  │   │ Dashboard│   │ Toolbar  │   │ Chaos Button│  │
-└──┼──────────┼───┼──────────┼───┼──────────┼───┼─────────────┼──┘
-   │          │   │          │   │          │   │             │
-   │ WebSocket│   │   SSE    │   │          │   │  HTTP REST  │
-   │  :8080   │   │  :8080   │   │          │   │   :8080     │
-   ▼          ▼   ▼          │   │          │   ▼             │
-┌──────────────────────────────────────────────────────────────┐
-│                        Gateway  :8080                         │
-│   /ws   WebSocket hub — receives STROKE_DRAW, STROKE_UNDO    │
-│   /events/cluster-status   SSE — pushes node health / leader │
-│   /chaos   Docker stop/kill for chaos engineering            │
-│   /internal/committed   POST from replicas on log commit     │
-│   /health   /metrics   Prometheus                            │
-└──────────┬──────────────────┬──────────────────┬─────────────┘
-           │                  │                  │
-           │  HTTP REST       │  HTTP REST       │  HTTP REST
-           │  /stroke /undo   │  /stroke /undo   │  /stroke /undo
-           │  /status /entries│  /status /entries│  /status /entries
+┌─────────────────────────────────────────────────────────────┐
+│                     Browser Clients                          │
+│               (Tab A / Tab B / Tab C)                        │
+└────────────────────────┬────────────────┬────────────────────┘
+                         │ WebSocket      │ SSE
+                         │ (strokes)      │ (cluster status)
+                         ▼               ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    Gateway :8080                              │
+│       Leader Tracker · WS Hub · Chaos API · SSE Hub          │
+└──────────┬──────────────────┬──────────────────┬────────────┘
+           │ HTTP POST        │ HTTP POST        │ HTTP POST
+           │ /stroke          │ /stroke          │ /stroke
+           │ HTTP GET         │ HTTP GET         │ HTTP GET
+           │ /status          │ /status          │ /status
            ▼                  ▼                  ▼
-    ┌─────────────┐   ┌─────────────┐   ┌─────────────┐
-    │  Replica 1  │   │  Replica 2  │   │  Replica 3  │
-    │  :8081/:9001│   │  :8082/:9002│   │  :8083/:9003│
-    │             │◄──┤             ├──►│             │
-    │  Raft node  │   │  Raft node  │   │  Raft node  │
-    │  WAL on disk│   │  WAL on disk│   │  WAL on disk│
-    └─────────────┘   └─────────────┘   └─────────────┘
-          gRPC :9001 ◄──────────────────────► gRPC :9001
-          (RequestVote, AppendEntries, Heartbeat, SyncLog)
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│  Replica 1   │  │  Replica 2   │  │  Replica 3   │
+│  :9001 gRPC  │◄─┤  :9002 gRPC  ├─►│  :9003 gRPC  │
+│  :8081 HTTP  │  │  :8082 HTTP  │  │  :8083 HTTP  │
+│              │  │              │  │              │
+│  ┌────────┐  │  │  ┌────────┐  │  │  ┌────────┐  │
+│  │WAL log │  │  │  │WAL log │  │  │  │WAL log │  │
+│  └────────┘  │  │  └────────┘  │  │  └────────┘  │
+└──────────────┘  └──────────────┘  └──────────────┘
+gRPC between replicas:
+  RequestVote · AppendEntries · Heartbeat · SyncLog
 ```
 
 **Protocol summary:**
@@ -56,11 +71,78 @@ failures without losing a stroke.
 
 ---
 
-## Quick Start
+## How it works
+
+### Consensus (RAFT)
+
+Three replicas run mini-RAFT with randomised election timeouts (500–800 ms) to
+prevent split votes, 150 ms heartbeats from the Leader, and a majority quorum of
+2 of 3 nodes to commit any entry. All inter-replica communication uses gRPC with
+Protocol Buffers. Term numbers enforce authority — any node receiving a message
+with a higher term immediately steps down to Follower and updates its term before
+processing the message, ensuring the cluster always converges on one Leader per
+term.
+
+### Log replication
+
+Every drawing stroke (and every undo) is a log entry. The Leader appends the entry
+to its local log, fans out `AppendEntries` RPCs to both followers in parallel, and
+marks the entry committed once a majority acknowledges it. A write-ahead log (WAL)
+is flushed and synced to disk before the node responds to any RPC, so entries
+survive container crashes and full cluster restarts. When a restarted node
+reconnects it sends a single `SyncLog` RPC containing its current log length; the
+Leader replies with the delta — one round-trip regardless of how far behind the
+follower is.
+
+### Gateway
+
+The gateway is the single entry point for all browser clients. It polls all three
+replica `/status` endpoints concurrently every 500 ms to track the current leader
+and detect leadership changes. Incoming strokes are forwarded directly to the
+leader's HTTP API; if no leader is known the gateway buffers the stroke in memory
+for up to 2 seconds, then drains the buffer once a leader is elected. When a
+replica commits a log entry it calls `POST /internal/committed` on the gateway,
+which immediately broadcasts `STROKE_COMMITTED` or `UNDO_COMPENSATION` to every
+connected WebSocket client. Chaos Mode talks to the Docker daemon directly over the
+mounted Unix socket (`/var/run/docker.sock`) using a minimal stdlib HTTP client —
+no external Docker SDK dependency.
+
+### Frontend
+
+The UI shell and dashboard are written in React; the drawing surface uses the
+Vanilla JS Canvas 2D API directly (bypassing React's reconciler entirely for
+paint-loop performance). Each browser client receives a UUID v4 user ID on
+WebSocket connect, which is attached to every stroke for per-user colour identity.
+Undo and redo flow through the full Raft pipeline: pressing undo sends a
+`STROKE_UNDO` message to the gateway, which forwards it to the leader's `/undo`
+endpoint; the leader appends an `UNDO_COMPENSATION` entry to the log, commits it
+via Raft, and the gateway broadcasts the compensation to all clients — preserving
+the append-only log invariant. The cluster status panel in the dashboard is fed by
+an SSE stream and updates in real time showing each replica's state, term, log
+length, and milliseconds since last heartbeat.
+
+---
+
+## RAFT protocol parameters
+
+| Parameter | Value | Why |
+|-----------|-------|-----|
+| Election timeout | 500–800 ms (random) | Randomisation prevents split votes |
+| Heartbeat interval | 150 ms | Must be << election timeout |
+| Vote RPC timeout | 300 ms | Allows slow nodes time to respond |
+| Majority threshold | 2 of 3 nodes | Tolerates 1 simultaneous failure |
+| Stroke buffer (no leader) | 2 seconds | Covers typical election duration |
+| WAL sync | Every write | Guarantees durability on crash |
+| SyncLog catch-up | Single RPC delta | Faster than per-heartbeat backfill |
+
+---
+
+## Quick start
 
 ### Prerequisites
 
-- [Docker](https://docs.docker.com/get-docker/) and [Docker Compose v2](https://docs.docker.com/compose/install/)
+- [Docker](https://docs.docker.com/get-docker/) and
+  [Docker Compose v2](https://docs.docker.com/compose/install/)
 - Go 1.22+ (for local development only — not needed to run with Docker)
 
 ### Run everything
@@ -86,19 +168,31 @@ Open **http://localhost:3000** in your browser.
 | `9002` | Replica 2 | gRPC (Raft RPCs) |
 | `9003` | Replica 3 | gRPC (Raft RPCs) |
 
-### Hot-reload development mode
+### Dev mode
 
 ```bash
-docker compose -f docker-compose.dev.yml up --build
+# Uses Dockerfile.dev + air for hot-reload on all replicas
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 ```
 
-Source files in `replica/` are bind-mounted into the containers. [Air](https://github.com/air-verse/air)
-watches for `.go` file changes and rebuilds automatically — editing any replica file
-triggers a zero-downtime restart and new leader election within ~2 seconds.
+Edit any file in `replica/` and save — the affected container rebuilds
+automatically, triggers a Raft election, and the system recovers without
+dropping clients.
+
+### Run the smoke test
+
+```bash
+chmod +x scripts/smoke-test.sh
+./scripts/smoke-test.sh
+```
+
+8 automated checks: boot, stroke commit, leader failover, post-failover stroke,
+replica restart, catch-up verification. Requires `websocat`, `wscat`, or
+Python `websockets`.
 
 ---
 
-## Demo Scenarios
+## Demo scenarios
 
 ### Kill the leader (chaos mode)
 
@@ -164,18 +258,32 @@ and confirms it catches up — then tears everything down.
 
 ---
 
-## Component Ownership
+## Failure scenarios
 
-| Name | Component | Key Files |
-|------|-----------|-----------|
-| Shrish | Raft Core Engine | `replica/raft/node.go`, `election.go`, `heartbeat.go` |
-| Saffiya | Log Replication + WAL | `replica/log/log.go`, `wal.go`, `replication.go` |
-| Rushad | Gateway + Docker + Chaos | `gateway/`, `docker-compose.yml` |
-| Ayesha | Frontend + Dashboard + Undo | `frontend/src/` |
+| Scenario | System behaviour |
+|----------|-----------------|
+| Leader dies | Election completes in < 800 ms. Gateway reroutes. No stroke loss if buffered. |
+| Follower dies | System continues normally. Majority (2/3) still available. |
+| Follower restarts | Replays WAL, requests SyncLog delta from leader, rejoins in one RPC. |
+| 2 of 3 replicas die | System stalls (no majority). Strokes buffered at gateway. Recovers when quorum restored. |
+| All 3 replicas restart | WAL replayed on each. Leader elected. CANVAS_SYNC restores all clients. |
+| Leader dies mid-commit | Entry stays in some follower logs. New leader re-evaluates via log matching. Uncommitted entries may be lost — correct Raft behaviour. |
+| Network partition (split brain) | Not simulated, but higher term always wins when partition heals. |
 
 ---
 
-## MiniRAFT Protocol Summary
+## Team & component ownership
+
+| Member | Component | Key files | Viva topics |
+|--------|-----------|-----------|-------------|
+| Shrish (PES2UG23AM097) | Raft Core Engine | `replica/raft/node.go`, `election.go`, `heartbeat.go` | Election timer, split votes, term demotion, heartbeat interval |
+| Saffiya (PES2UG23AM87) | Log Replication + WAL | `replica/log/log.go`, `wal.go`, `replication.go` | prevLogIndex check, WAL durability, catch-up protocol, commit quorum |
+| Rushad (PES2UG23AM061) | Gateway + Docker + Chaos | `gateway/`, `docker-compose.yml`, `scripts/` | Leader routing, stroke buffering, Docker socket, air hot-reload |
+| Ayesha (PES2UG23AM921) | Frontend + Dashboard + Undo | `frontend/src/` | Log compensation undo, SSE dashboard, colour identity, optimistic rendering |
+
+---
+
+## MiniRAFT protocol summary
 
 - **Leader election** — each node starts an election timer (500–800 ms random). If
   no heartbeat arrives before it fires, the node becomes a Candidate, increments its
@@ -183,28 +291,29 @@ and confirms it catches up — then tears everything down.
   (≥ 2/3) wins and becomes Leader.
 
 - **Heartbeats** — the Leader sends `AppendEntries` (empty or with new entries) to
-  all peers every 150 ms. If a follower misses enough heartbeats its timer fires and a
-  new election begins. Heartbeats run in a dedicated goroutine that is cancelled
+  all peers every 150 ms. If a follower misses enough heartbeats its timer fires and
+  a new election begins. Heartbeats run in a dedicated goroutine that is cancelled
   immediately when the node steps down.
 
 - **Log replication** — all mutations (stroke draws, undo compensations) are
   forwarded to the Leader's HTTP API. The Leader appends the entry to its log and
   replicates it to followers via `AppendEntries`. Once a majority acknowledges the
-  entry it is committed and the Leader calls `POST /internal/committed` on the gateway,
-  which broadcasts `STROKE_COMMITTED` / `UNDO_COMPENSATION` to all WebSocket clients.
+  entry it is committed and the Leader calls `POST /internal/committed` on the
+  gateway, which broadcasts `STROKE_COMMITTED` / `UNDO_COMPENSATION` to all
+  WebSocket clients.
 
 - **Log catch-up** — a follower that falls behind (e.g. after restart) receives the
-  missing entries in bulk via the `SyncLog` gRPC call, which the Leader initiates via
-  `catchUpPeer` whenever an `AppendEntries` rejection signals a log gap.
+  missing entries in bulk via the `SyncLog` gRPC call, which the Leader initiates
+  via `catchUpPeer` whenever an `AppendEntries` rejection signals a log gap.
 
-- **Durability** — every log entry is written to a WAL (Write-Ahead Log) on disk and
-  `fsync`-ed before the node acknowledges it. On restart, the WAL is replayed to
-  restore the full log and commit index before the node joins the cluster.
+- **Durability** — every log entry is written to a WAL (Write-Ahead Log) on disk
+  and `fsync`-ed before the node acknowledges it. On restart, the WAL is replayed
+  to restore the full log and commit index before the node joins the cluster.
 
 - **Gateway buffering** — while the cluster has no leader (during elections) the
-  gateway buffers incoming strokes in memory for up to 2 s. Once a leader is elected
-  the buffer is drained and all pending strokes are committed. Strokes older than 2 s
-  are dropped with an error returned to the originating client.
+  gateway buffers incoming strokes in memory for up to 2 s. Once a leader is
+  elected the buffer is drained and all pending strokes are committed. Strokes
+  older than 2 s are dropped with an error returned to the originating client.
 
 - **Optimistic UI** — strokes appear immediately on the drawing client at 70 %
   opacity (pending state) and switch to full opacity when `STROKE_COMMITTED` is
@@ -213,24 +322,17 @@ and confirms it catches up — then tears everything down.
 
 ---
 
-## Known Limitations
+## Known limitations
 
-The following items were reviewed during the pre-submission audit and intentionally
-deferred as low-risk or by-design deviations:
+- **Defensive truncation guard only:** `TruncateFrom()` refuses to truncate
+  committed entries but correct Raft (Leader Completeness Property) guarantees
+  this path is never reached in normal operation.
 
-- **`TruncateFrom` committed-index guard is defensive only** — the guard in
-  `replica/log/log.go` refuses to truncate at or below the commit index and returns
-  an error, which `AppendEntries` propagates as `Success: false`. In a correct Raft
-  implementation the leader never sends a conflicting entry below the commit index, so
-  this path is unreachable in normal operation. It exists as a safety net.
+- **Pending stroke layer uses `globalAlpha`:** optimistic rendering draws pending
+  strokes at 70 % opacity via `globalAlpha` on the full canvas context rather than
+  a true separate compositing layer. Visually correct but architecturally impure.
 
-- **Optimistic pending layer uses `globalAlpha` instead of a true separate canvas** —
-  pending strokes are drawn at 70 % opacity by setting `ctx.globalAlpha = 0.7` in
-  `drawing.js`. A production implementation would render pending strokes on an
-  off-screen canvas and composite them, which would be more efficient for dense scenes.
-
-- **No strokeId deduplication at the replica level** — deduplication of duplicate
-  `STROKE_DRAW` messages (e.g. client retry) happens only at the gateway
-  (`gateway/ws/handler.go`). If a stroke somehow reaches a replica twice it would
-  be written as two log entries with the same `strokeId`. The gateway's 60-second
-  dedup window makes this effectively impossible in practice.
+- **No replica-level strokeId deduplication:** gateway deduplicates by `strokeId`
+  (60-second window) but a duplicate that bypasses the gateway (e.g. direct
+  `POST` to `/stroke`) would create two log entries with the same semantic stroke.
+  Demo-safe — not reachable via the UI.
