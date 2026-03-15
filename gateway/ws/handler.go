@@ -342,7 +342,9 @@ func extractStrokeID(payload json.RawMessage) string {
 	var m struct {
 		StrokeID string `json:"strokeId"`
 	}
-	json.Unmarshal(payload, &m) //nolint:errcheck
+	if err := json.Unmarshal(payload, &m); err != nil {
+		return ""
+	}
 	return m.StrokeID
 }
 
