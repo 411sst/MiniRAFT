@@ -193,10 +193,15 @@ func (n *RaftNode) SyncFromPeers() {
 			continue
 		}
 
+		n.mu.Lock()
+		currentTerm := n.currentTerm
+		n.mu.Unlock()
+
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		resp, err := client.SyncLog(ctx, &proto.SyncLogRequest{
 			ReplicaId: n.id,
 			FromIndex: fromIndex,
+			Term:      currentTerm,
 		})
 		cancel()
 

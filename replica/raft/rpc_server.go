@@ -8,6 +8,8 @@ import (
 	proto "miniraft/replica/proto"
 
 	"go.uber.org/zap"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // RaftRPCServer implements proto.RaftServiceServer.
@@ -149,7 +151,14 @@ func (s *RaftRPCServer) AppendEntries(_ context.Context, req *proto.AppendEntrie
 		if ok {
 			if existing.Term != pe.Term {
 				// Conflict: truncate our log from this index onward.
-				n.log.TruncateFrom(pe.Index)
+				if err := n.log.TruncateFrom(pe.Index); err != nil {
+					s.logger.Error("TruncateFrom rejected — refusing to truncate committed entry",
+						zap.Error(err))
+					return &proto.AppendEntriesResponse{
+						Term:    currentTerm,
+						Success: false,
+					}, nil
+				}
 				if err := n.log.AppendEntry(protoToLogEntry(pe)); err != nil {
 					s.logger.Error("AppendEntry failed", zap.Error(err))
 				}
@@ -228,7 +237,26 @@ func (s *RaftRPCServer) SyncLog(_ context.Context, req *proto.SyncLogRequest) (*
 	s.logger.Debug("SyncLog received",
 		zap.String("replicaId", req.ReplicaId),
 		zap.Int64("fromIndex", req.FromIndex),
+		zap.Int64("term", req.Term),
 	)
+
+	// Reject SyncLog from stale leaders to prevent a deposed leader from
+	// overwriting a follower's log with stale entries.
+	n.mu.Lock()
+	currentTerm := n.currentTerm
+	n.mu.Unlock()
+
+	if req.Term < currentTerm {
+		s.logger.Warn("SyncLog rejected: stale term",
+			zap.Int64("reqTerm", req.Term),
+			zap.Int64("currentTerm", currentTerm),
+		)
+		return &proto.SyncLogResponse{}, status.Errorf(codes.PermissionDenied,
+			"stale term %d < current %d", req.Term, currentTerm)
+	}
+	if req.Term > currentTerm {
+		n.BecomeFollower(req.Term, "")
+	}
 
 	entries := n.log.GetEntriesFrom(req.FromIndex)
 	commitIndex := n.log.GetCommitIndex()

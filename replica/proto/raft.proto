@@ -49,6 +49,7 @@ message HeartbeatResponse {
 message SyncLogRequest {
   int64  from_index = 1; // follower requests entries from this index
   string replica_id = 2;
+  int64  term       = 3; // caller's current term; receiver rejects if stale
 }
 
 message SyncLogResponse {

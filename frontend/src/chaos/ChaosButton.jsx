@@ -72,7 +72,7 @@ export default function ChaosButton() {
           onChange={(e) => setMode(e.target.value)}
           style={selectStyle}
         >
-          <option value="random">Random</option>
+          <option value="random">Surprise</option>
           <option value="graceful">Graceful</option>
           <option value="hard">Hard Kill</option>
         </select>

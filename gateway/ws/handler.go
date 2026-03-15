@@ -3,12 +3,12 @@ package ws
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
 	"miniraft/gateway/leader"
@@ -62,8 +62,12 @@ type WSHub struct {
 	}
 
 	// Stroke buffer: holds strokes queued while there is no leader.
-	bufMu   sync.Mutex
-	buffer  []pendingStroke
+	bufMu  sync.Mutex
+	buffer []pendingStroke
+
+	// Deduplication cache: recently seen strokeIds to drop client retries.
+	seenMu      sync.Mutex
+	seenStrokes map[string]time.Time // strokeId -> first seen
 }
 
 // NewWSHub creates a new WSHub.
@@ -73,12 +77,28 @@ func NewWSHub(tracker *leader.LeaderTracker, logger *zap.Logger, metrics interfa
 	IncrStrokes()
 }) *WSHub {
 	h := &WSHub{
-		clients: make(map[string]*Client),
-		tracker: tracker,
-		logger:  logger,
-		metrics: metrics,
+		clients:     make(map[string]*Client),
+		tracker:     tracker,
+		logger:      logger,
+		metrics:     metrics,
+		seenStrokes: make(map[string]time.Time),
 	}
 	go h.drainBuffer()
+	// Expire seen strokeIds older than 60 seconds every 30 seconds.
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			h.seenMu.Lock()
+			cutoff := time.Now().Add(-60 * time.Second)
+			for id, t := range h.seenStrokes {
+				if t.Before(cutoff) {
+					delete(h.seenStrokes, id)
+				}
+			}
+			h.seenMu.Unlock()
+		}
+	}()
 	return h
 }
 
@@ -98,7 +118,7 @@ func (h *WSHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userID := fmt.Sprintf("user-%d", time.Now().UnixNano())
+	userID := uuid.New().String()
 
 	h.mu.Lock()
 	colour := colourPalette[h.colourIndex%len(colourPalette)]
@@ -317,9 +337,35 @@ func (h *WSHub) drainBuffer() {
 	}
 }
 
+// extractStrokeID parses strokeId from a raw JSON stroke payload.
+func extractStrokeID(payload json.RawMessage) string {
+	var m struct {
+		StrokeID string `json:"strokeId"`
+	}
+	json.Unmarshal(payload, &m) //nolint:errcheck
+	return m.StrokeID
+}
+
 // forwardStrokeToLeader sends a stroke to the leader's POST /stroke endpoint.
 // Retries once if the leader returns 503 (stepped down). Buffers if no leader.
+// Deduplicates by strokeId to drop client retries.
 func (h *WSHub) forwardStrokeToLeader(userID string, payload json.RawMessage) {
+	// Deduplication: drop strokes we've already forwarded within the last 60s.
+	strokeID := extractStrokeID(payload)
+	if strokeID != "" {
+		h.seenMu.Lock()
+		if _, seen := h.seenStrokes[strokeID]; seen {
+			h.seenMu.Unlock()
+			h.logger.Debug("duplicate strokeId dropped",
+				zap.String("strokeId", strokeID),
+				zap.String("userID", userID),
+			)
+			return
+		}
+		h.seenStrokes[strokeID] = time.Now()
+		h.seenMu.Unlock()
+	}
+
 	body, err := json.Marshal(map[string]interface{}{
 		"userId":  userID,
 		"payload": payload,

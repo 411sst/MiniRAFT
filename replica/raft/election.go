@@ -83,7 +83,7 @@ func (n *RaftNode) startElection() {
 				return
 			}
 
-			ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 			defer cancel()
 
 			resp, err := client.RequestVote(ctx, &proto.VoteRequest{

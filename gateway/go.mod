@@ -10,3 +10,5 @@ require (
 	github.com/prometheus/client_golang v1.19.1
 	go.uber.org/zap v1.27.0
 )
+
+require github.com/google/uuid v1.6.0 // indirect
