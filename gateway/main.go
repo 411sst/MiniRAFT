@@ -84,19 +84,27 @@ func main() {
 	// Create metrics.
 	m := metrics.NewGatewayMetrics()
 
-	// sseHub is created below; use a pointer so onChange can reference it.
+	// sseHub and wsHub are created below; use pointers so onChange can reference them.
 	var sseHub *sse.SSEHub
+	var wsHub *ws.WSHub
 
 	// Create leader tracker.
 	tracker := leader.NewLeaderTracker(replicas, logger, func(newLeaderID string, term int64) {
 		m.IncrLeaderChanges()
 		logger.Info("leader changed", zap.String("leader", newLeaderID), zap.Int64("term", term))
+		data, _ := json.Marshal(map[string]interface{}{
+			"leaderId": newLeaderID,
+			"term":     term,
+		})
 		if sseHub != nil {
-			data, _ := json.Marshal(map[string]interface{}{
+			sseHub.Broadcast("leader_elected", string(data))
+		}
+		// Push LEADER_CHANGED to all WebSocket clients so the toolbar updates immediately.
+		if wsHub != nil {
+			wsHub.BroadcastMessage("LEADER_CHANGED", map[string]interface{}{
 				"leaderId": newLeaderID,
 				"term":     term,
 			})
-			sseHub.Broadcast("leader_elected", string(data))
 		}
 	})
 
@@ -104,7 +112,7 @@ func main() {
 	sseHub = sse.NewSSEHub(tracker, logger)
 
 	// Create WebSocket hub.
-	wsHub := ws.NewWSHub(tracker, logger, m)
+	wsHub = ws.NewWSHub(tracker, logger, m)
 
 	// Create chaos handler (best-effort; falls back to stub if Docker unavailable).
 	var chaosHTTP http.Handler

@@ -82,10 +82,17 @@ export default function NodeCard({ status }) {
             <span className="text-green-400 font-mono truncate max-w-24">{leaderId}</span>
           </div>
         )}
-        {lastHeartbeatMs != null && (
+        {lastHeartbeatMs != null && lastHeartbeatMs > 0 && (
           <div className="flex justify-between">
             <span>Last HB</span>
-            <span className="text-gray-300 font-mono">{lastHeartbeatMs}ms</span>
+            <span className="text-gray-300 font-mono">
+              {(() => {
+                const ageMs = Date.now() - lastHeartbeatMs
+                if (ageMs < 0) return 'now'
+                if (ageMs < 1000) return `${ageMs}ms ago`
+                return `${(ageMs / 1000).toFixed(1)}s ago`
+              })()}
+            </span>
           </div>
         )}
       </div>

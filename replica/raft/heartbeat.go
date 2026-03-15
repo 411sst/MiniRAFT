@@ -156,7 +156,11 @@ func sendHeartbeats(n *RaftNode) {
 							} else if n.nextIndex[task.peer] > 1 {
 								n.nextIndex[task.peer]--
 							}
+							conflictIdx := n.nextIndex[task.peer]
 							n.mu.Unlock()
+
+							// Immediately push missing entries without waiting for the next tick.
+							go n.catchUpPeer(task.peer, conflictIdx)
 						}
 					}
 
@@ -170,6 +174,82 @@ func sendHeartbeats(n *RaftNode) {
 			n.logger.Debug("heartbeat sender stopped")
 			return
 		}
+	}
+}
+
+// catchUpPeer immediately sends all log entries from fromIndex to a specific peer via
+// AppendEntries — called when a heartbeat reveals a log mismatch, so we don't wait
+// 150ms for the next tick to retry.
+func (n *RaftNode) catchUpPeer(peer string, fromIndex int64) {
+	client, ok := n.getPeerClient(peer)
+	if !ok {
+		return
+	}
+
+	entries := n.log.GetEntriesFrom(fromIndex)
+	if len(entries) == 0 {
+		return
+	}
+
+	protoEntries := make([]*proto.LogEntry, len(entries))
+	for i, e := range entries {
+		data, _ := json.Marshal(e.Data)
+		protoEntries[i] = &proto.LogEntry{
+			Index:     e.Index,
+			Term:      e.Term,
+			Type:      string(e.Type),
+			StrokeId:  e.StrokeID,
+			UserId:    e.UserID,
+			Data:      data,
+			Timestamp: e.Timestamp,
+		}
+	}
+
+	n.mu.Lock()
+	if n.state != Leader {
+		n.mu.Unlock()
+		return
+	}
+	currentTerm := n.currentTerm
+	leaderID := n.id
+	commitIndex := n.commitIndex
+	var prevLogIndex, prevLogTerm int64
+	if fromIndex > 1 {
+		if prev, ok2 := n.log.GetEntry(fromIndex - 1); ok2 {
+			prevLogIndex = prev.Index
+			prevLogTerm = prev.Term
+		}
+	}
+	n.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	resp, err := client.AppendEntries(ctx, &proto.AppendEntriesRequest{
+		Term:         currentTerm,
+		LeaderId:     leaderID,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      protoEntries,
+		LeaderCommit: commitIndex,
+	})
+	if err != nil {
+		n.logger.Debug("catchUpPeer AppendEntries failed", zap.String("peer", peer), zap.Error(err))
+		return
+	}
+	if resp.Term > currentTerm {
+		n.BecomeFollower(resp.Term, "")
+		return
+	}
+	if resp.Success {
+		n.mu.Lock()
+		lastNewIdx := fromIndex + int64(len(entries)) - 1
+		if lastNewIdx > n.matchIndex[peer] {
+			n.matchIndex[peer] = lastNewIdx
+			n.nextIndex[peer] = lastNewIdx + 1
+		}
+		n.tryAdvanceCommitIndex()
+		n.mu.Unlock()
 	}
 }
 

@@ -67,48 +67,60 @@ func (t *LeaderTracker) Start(ctx context.Context) {
 	}()
 }
 
-// poll fetches status from all replicas and updates the tracked leader.
+// poll fetches status from all replicas concurrently and updates the tracked leader.
 func (t *LeaderTracker) poll() {
+	type result struct {
+		replicaID string
+		status    NodeStatus
+		err       error
+	}
+
+	httpClient := &http.Client{Timeout: 300 * time.Millisecond}
+	resultCh := make(chan result, len(t.replicas))
+
+	// Fan out: one goroutine per replica (not sequential).
+	for _, replica := range t.replicas {
+		go func(r ReplicaConfig) {
+			s, err := fetchStatus(httpClient, r)
+			resultCh <- result{replicaID: r.ID, status: s, err: err}
+		}(replica)
+	}
+
 	var (
 		bestLeaderID string
 		bestTerm     int64 = -1
 	)
 
-	httpClient := &http.Client{Timeout: 300 * time.Millisecond}
+	// Collect all results.
+	for i := 0; i < len(t.replicas); i++ {
+		res := <-resultCh
 
-	for _, replica := range t.replicas {
-		status, err := fetchStatus(httpClient, replica)
-		if err != nil {
+		t.mu.Lock()
+		if res.err != nil {
 			t.logger.Debug("failed to fetch replica status",
-				zap.String("replica", replica.ID),
-				zap.Error(err),
+				zap.String("replica", res.replicaID),
+				zap.Error(res.err),
 			)
-			// Mark as unhealthy in statuses
-			t.mu.Lock()
-			if prev, ok := t.statuses[replica.ID]; ok {
+			if prev, ok := t.statuses[res.replicaID]; ok {
 				prev.Healthy = false
-				t.statuses[replica.ID] = prev
+				t.statuses[res.replicaID] = prev
 			} else {
-				t.statuses[replica.ID] = NodeStatus{
-					ReplicaID: replica.ID,
+				t.statuses[res.replicaID] = NodeStatus{
+					ReplicaID: res.replicaID,
 					Healthy:   false,
 				}
 			}
-			t.mu.Unlock()
-			continue
+		} else {
+			t.statuses[res.replicaID] = res.status
+			if res.status.State == "LEADER" && res.status.Term > bestTerm {
+				bestTerm = res.status.Term
+				bestLeaderID = res.status.ReplicaID
+			}
 		}
-
-		t.mu.Lock()
-		t.statuses[replica.ID] = status
 		t.mu.Unlock()
-
-		if status.State == "LEADER" && status.Term > bestTerm {
-			bestTerm = status.Term
-			bestLeaderID = status.ReplicaID
-		}
 	}
 
-	// If no leader found via state==LEADER, try leaderId field
+	// If no replica reports LEADER directly, fall back to leaderId field.
 	if bestLeaderID == "" {
 		t.mu.RLock()
 		for _, s := range t.statuses {

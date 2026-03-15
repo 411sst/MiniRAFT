@@ -117,10 +117,12 @@ export default function ChaosButton() {
         >
           {lastResult.error ? (
             <span>Error: {lastResult.error}</span>
-          ) : (
+          ) : lastResult.killed ? (
             <span>
-              {lastResult.message || JSON.stringify(lastResult)}
+              Killed <strong>{lastResult.killed}</strong> ({lastResult.mode === 'graceful' ? 'graceful stop' : 'hard kill'})
             </span>
+          ) : (
+            <span>{JSON.stringify(lastResult)}</span>
           )}
         </div>
       )}

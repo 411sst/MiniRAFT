@@ -7,12 +7,13 @@ import {
   endStroke,
   addCommittedStroke,
   removeStroke,
+  clearAllStrokes,
   startRenderLoop,
   stopRenderLoop,
   setDrawingConfig,
 } from './drawing'
 
-export default function Canvas({ tool, strokeWidth, userInfo, onUserAssigned, onConnectionStatus }) {
+export default function Canvas({ tool, strokeWidth, userInfo, onUserAssigned, onConnectionStatus, onLeaderInfo }) {
   const canvasRef = useRef(null)
   const isDrawingRef = useRef(false)
   const sendMessageRef = useRef(null)
@@ -64,6 +65,8 @@ export default function Canvas({ tool, strokeWidth, userInfo, onUserAssigned, on
 
   const handleCanvasSync = useCallback((entries) => {
     if (!Array.isArray(entries)) return
+    // Clear existing canvas state before replaying — critical for reconnect correctness.
+    clearAllStrokes()
     entries.forEach((entry) => {
       if (entry.type === 'UNDO_COMPENSATION') {
         if (entry.strokeId) removeStroke(entry.strokeId)
@@ -86,6 +89,10 @@ export default function Canvas({ tool, strokeWidth, userInfo, onUserAssigned, on
   useEffect(() => {
     if (onConnectionStatus) onConnectionStatus(connectionStatus)
   }, [connectionStatus, onConnectionStatus])
+
+  useEffect(() => {
+    if (onLeaderInfo) onLeaderInfo(leaderInfo)
+  }, [leaderInfo, onLeaderInfo])
 
   // Undo: pop from undoStack, push to redoStack, send STROKE_UNDO
   useEffect(() => {

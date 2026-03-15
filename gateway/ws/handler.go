@@ -42,9 +42,10 @@ type Client struct {
 
 // pendingStroke holds a stroke buffered during a leaderless period.
 type pendingStroke struct {
-	userID  string
-	payload json.RawMessage
-	kind    string // "draw" or "undo"
+	userID    string
+	payload   json.RawMessage
+	kind      string    // "draw" or "undo"
+	arrivedAt time.Time // for 2-second timeout tracking
 }
 
 // WSHub manages all WebSocket clients.
@@ -266,49 +267,59 @@ func (h *WSHub) handleMessage(client *Client, msg WSMessage) {
 	}
 }
 
-// drainBuffer periodically retries buffered strokes once a leader is available.
+// drainBuffer retries buffered strokes every 100ms. Strokes older than 2 seconds
+// are discarded and an ERROR message is sent to the originating client.
 func (h *WSHub) drainBuffer() {
-	ticker := time.NewTicker(300 * time.Millisecond)
+	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for range ticker.C {
-		_, ok := h.tracker.GetLeaderConfig()
-		if !ok {
-			continue
-		}
-
 		h.bufMu.Lock()
 		if len(h.buffer) == 0 {
 			h.bufMu.Unlock()
 			continue
 		}
-		pending := h.buffer
-		h.buffer = nil
+
+		now := time.Now()
+		_, hasLeader := h.tracker.GetLeaderConfig()
+
+		var ready []pendingStroke
+		var remaining []pendingStroke
+
+		for _, p := range h.buffer {
+			if now.Sub(p.arrivedAt) > 2*time.Second {
+				// Expired — notify client and discard.
+				h.logger.Warn("stroke buffer timeout, dropping stroke",
+					zap.String("userID", p.userID),
+					zap.Duration("buffered", now.Sub(p.arrivedAt)),
+				)
+				go h.SendToClient(p.userID, "ERROR", map[string]string{
+					"message": "stroke dropped: no leader available after 2 seconds",
+				})
+			} else if hasLeader {
+				ready = append(ready, p)
+			} else {
+				remaining = append(remaining, p)
+			}
+		}
+		h.buffer = remaining
 		h.bufMu.Unlock()
 
-		h.logger.Info("draining stroke buffer", zap.Int("count", len(pending)))
-		for _, p := range pending {
-			if p.kind == "undo" {
-				go h.forwardUndoToLeader(p.userID, p.payload)
-			} else {
-				go h.forwardStrokeToLeader(p.userID, p.payload)
+		if len(ready) > 0 {
+			h.logger.Info("draining stroke buffer", zap.Int("count", len(ready)))
+			for _, p := range ready {
+				if p.kind == "undo" {
+					go h.forwardUndoToLeader(p.userID, p.payload)
+				} else {
+					go h.forwardStrokeToLeader(p.userID, p.payload)
+				}
 			}
 		}
 	}
 }
 
 // forwardStrokeToLeader sends a stroke to the leader's POST /stroke endpoint.
-// The leader will replicate it and call back /internal/committed; that handler
-// broadcasts STROKE_COMMITTED to all clients.
+// Retries once if the leader returns 503 (stepped down). Buffers if no leader.
 func (h *WSHub) forwardStrokeToLeader(userID string, payload json.RawMessage) {
-	cfg, ok := h.tracker.GetLeaderConfig()
-	if !ok {
-		h.logger.Warn("no leader — buffering stroke until election completes", zap.String("userID", userID))
-		h.bufMu.Lock()
-		h.buffer = append(h.buffer, pendingStroke{userID: userID, payload: payload, kind: "draw"})
-		h.bufMu.Unlock()
-		return
-	}
-
 	body, err := json.Marshal(map[string]interface{}{
 		"userId":  userID,
 		"payload": payload,
@@ -318,22 +329,43 @@ func (h *WSHub) forwardStrokeToLeader(userID string, payload json.RawMessage) {
 		return
 	}
 
-	httpClient := &http.Client{Timeout: 5 * time.Second}
-	resp, err := httpClient.Post(cfg.StrokeURL, "application/json", bytes.NewReader(body))
-	if err != nil {
-		h.logger.Warn("failed to forward stroke to leader",
+	for attempt := 0; attempt < 2; attempt++ {
+		cfg, ok := h.tracker.GetLeaderConfig()
+		if !ok {
+			h.logger.Warn("no leader — buffering stroke until election completes", zap.String("userID", userID))
+			h.bufMu.Lock()
+			h.buffer = append(h.buffer, pendingStroke{userID: userID, payload: payload, kind: "draw", arrivedAt: time.Now()})
+			h.bufMu.Unlock()
+			return
+		}
+
+		httpClient := &http.Client{Timeout: 5 * time.Second}
+		resp, err := httpClient.Post(cfg.StrokeURL, "application/json", bytes.NewReader(body))
+		if err != nil {
+			h.logger.Warn("failed to forward stroke to leader",
+				zap.String("leaderID", cfg.ID),
+				zap.Error(err),
+			)
+			return
+		}
+		io.Copy(io.Discard, resp.Body) //nolint:errcheck
+		resp.Body.Close()
+
+		if resp.StatusCode == http.StatusServiceUnavailable && attempt == 0 {
+			// Leader stepped down — wait briefly for tracker to detect new leader, then retry.
+			h.logger.Warn("leader returned 503, retrying with fresh leader",
+				zap.String("staleLeader", cfg.ID),
+			)
+			time.Sleep(60 * time.Millisecond)
+			continue
+		}
+
+		h.logger.Debug("stroke forwarded to leader",
 			zap.String("leaderID", cfg.ID),
-			zap.Error(err),
+			zap.Int("status", resp.StatusCode),
 		)
 		return
 	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body) //nolint:errcheck
-
-	h.logger.Debug("stroke forwarded to leader",
-		zap.String("leaderID", cfg.ID),
-		zap.Int("status", resp.StatusCode),
-	)
 }
 
 // forwardUndoToLeader sends a STROKE_UNDO to the leader's POST /undo endpoint.
@@ -342,7 +374,7 @@ func (h *WSHub) forwardUndoToLeader(userID string, payload json.RawMessage) {
 	if !ok {
 		h.logger.Warn("no leader — buffering undo until election completes", zap.String("userID", userID))
 		h.bufMu.Lock()
-		h.buffer = append(h.buffer, pendingStroke{userID: userID, payload: payload, kind: "undo"})
+		h.buffer = append(h.buffer, pendingStroke{userID: userID, payload: payload, kind: "undo", arrivedAt: time.Now()})
 		h.bufMu.Unlock()
 		return
 	}

@@ -1,14 +1,17 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -174,16 +177,37 @@ func main() {
 	// 11. Start RaftNode.
 	node.Start()
 
-	// 12. Start HTTP server (blocking).
+	// 12. Start HTTP server in background.
 	logger.Info("replica started",
 		zap.String("replicaId", replicaID),
 		zap.String("grpcPort", grpcPort),
 		zap.String("httpPort", httpPort),
 		zap.String("dataDir", dataDir),
 	)
-	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		logger.Fatal("HTTP server error", zap.Error(err))
+	go func() {
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Fatal("HTTP server error", zap.Error(err))
+		}
+	}()
+
+	// 13. Wait for SIGTERM or SIGINT then shut down gracefully.
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
+	<-quit
+
+	logger.Info("shutdown signal received, draining in-flight RPCs...")
+
+	// Stop accepting new gRPC calls and wait for in-flight ones to complete.
+	grpcServer.GracefulStop()
+
+	// Shutdown the HTTP server with a 5-second deadline.
+	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := httpServer.Shutdown(shutCtx); err != nil {
+		logger.Warn("HTTP server shutdown timed out", zap.Error(err))
 	}
+
+	logger.Info("replica shutdown complete")
 }
 
 // strokeRequest is the JSON body for POST /stroke.
