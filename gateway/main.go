@@ -151,20 +151,20 @@ func main() {
 // The leader calls this whenever an entry is committed, and the gateway
 // broadcasts STROKE_COMMITTED to all WebSocket clients.
 func internalCommittedHandler(hub *ws.WSHub, logger *zap.Logger) http.HandlerFunc {
-	type committedEntry struct {
-		Index     int64              `json:"index"`
-		Term      int64              `json:"term"`
-		Type      string             `json:"type"`
-		StrokeID  string             `json:"strokeId"`
-		UserID    string             `json:"userId"`
-		Timestamp int64              `json:"ts"`
-		Data      committedStrokeData `json:"data"`
-	}
 	type committedStrokeData struct {
 		Points []map[string]float64 `json:"points"`
 		Colour string               `json:"colour"`
 		Width  float64              `json:"width"`
 		Tool   string               `json:"tool"`
+	}
+	type committedEntry struct {
+		Index     int64               `json:"index"`
+		Term      int64               `json:"term"`
+		Type      string              `json:"type"`
+		StrokeID  string              `json:"strokeId"`
+		UserID    string              `json:"userId"`
+		Timestamp int64               `json:"ts"`
+		Data      committedStrokeData `json:"data"`
 	}
 
 	return func(w http.ResponseWriter, r *http.Request) {
